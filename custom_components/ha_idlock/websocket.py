@@ -372,7 +372,7 @@ async def ws_get_device_settings(
         return
     _, _, device = result
     # Read attributes if not loaded yet (e.g. first settings panel open)
-    if device.master_pin_mode is None:
+    if device.mfr_attrs_supported is None:
         await device.async_read_device_info()
     connection.send_result(msg["id"], device.get_device_info())
 

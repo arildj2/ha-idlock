@@ -83,6 +83,7 @@ class IDLockDevice:
         self.module_build: str | None = None       # 0x4000: Zigbee module build (e.g. "0.7")
 
         # IDLock manufacturer-specific settings
+        self.mfr_attrs_supported: bool | None = None  # None=unknown, True/False after first read
         self.master_pin_mode: bool | None = None
         self.rfid_enabled: bool | None = None
         self.require_pin_for_rf: bool | None = None
@@ -283,6 +284,8 @@ class IDLockDevice:
             if ATTR_AUDIO_VOLUME in attrs:
                 self.audio_volume = int(attrs[ATTR_AUDIO_VOLUME])
 
+            self.mfr_attrs_supported = bool(attrs)
+
             _LOGGER.debug(
                 "[IDLock] %s: master_pin=%s, rfid=%s, service_pin=%s, "
                 "lock_mode=%s, relock=%s, volume=%s",
@@ -295,8 +298,9 @@ class IDLockDevice:
                 self.audio_volume,
             )
         except Exception:  # noqa: BLE001
+            self.mfr_attrs_supported = False
             _LOGGER.warning(
-                "[IDLock] Could not read manufacturer attributes for %s (may not be IDLock)",
+                "[IDLock] Could not read manufacturer attributes for %s (timeout or unsupported firmware)",
                 self.ieee,
                 exc_info=True,
             )
@@ -308,6 +312,7 @@ class IDLockDevice:
             "connected": self.connected,
             "lock_firmware": self.lock_firmware,
             "module_build": self.module_build,
+            "mfr_attrs_supported": self.mfr_attrs_supported,
             "num_pin_slots": self.num_pin_slots,
             "num_rfid_slots": self.num_rfid_slots,
             "max_pin_len": self.max_pin_len,

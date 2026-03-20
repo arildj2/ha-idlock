@@ -734,16 +734,7 @@ class HaIdlockPanel extends LitElement {
         </div>`
       : "";
 
-    // If all manufacturer settings are null, the read from the lock failed
-    if (s && s.master_pin_mode == null && s.relock_enabled == null && s.lock_mode == null) {
-      return html`
-        ${fwInfo}
-        <p class="empty">Could not read settings from lock. The lock may be asleep — try waking it first.</p>
-        <button class="btn-sm" @click=${() => this._loadSettings(lock.device_ieee)} ?disabled=${this._busy}>
-          <ha-icon icon="mdi:refresh"></ha-icon> Retry
-        </button>
-      `;
-    }
+    const mfrSupported = s.mfr_attrs_supported !== false;
 
     // Use pending value if staged, otherwise device value
     const val = (key, fallback) => p[key] ?? s[key] ?? fallback;
@@ -799,19 +790,21 @@ class HaIdlockPanel extends LitElement {
         <div class="setting-group">
           <h3>Access</h3>
 
-          <div class="setting-row">
-            <label>Master PIN can unlock</label>
-            <input type="checkbox" .checked=${val("master_pin_mode", true)}
-              @change=${(e) => this._stageSetting("master_pin_mode", e.target.checked)}
-              ?disabled=${this._busy} />
-          </div>
+          ${mfrSupported ? html`
+            <div class="setting-row">
+              <label>Master PIN can unlock</label>
+              <input type="checkbox" .checked=${val("master_pin_mode", true)}
+                @change=${(e) => this._stageSetting("master_pin_mode", e.target.checked)}
+                ?disabled=${this._busy} />
+            </div>
 
-          <div class="setting-row">
-            <label>RFID enabled</label>
-            <input type="checkbox" .checked=${val("rfid_enabled", true)}
-              @change=${(e) => this._stageSetting("rfid_enabled", e.target.checked)}
-              ?disabled=${this._busy} />
-          </div>
+            <div class="setting-row">
+              <label>RFID enabled</label>
+              <input type="checkbox" .checked=${val("rfid_enabled", true)}
+                @change=${(e) => this._stageSetting("rfid_enabled", e.target.checked)}
+                ?disabled=${this._busy} />
+            </div>
+          ` : ""}
 
           <div class="setting-row">
             <label>Require PIN for RF</label>
@@ -819,52 +812,58 @@ class HaIdlockPanel extends LitElement {
               @change=${(e) => this._stageSetting("require_pin_for_rf", e.target.checked)}
               ?disabled=${this._busy} />
           </div>
-        </div>
 
-        <div class="setting-group">
-          <h3>Lock behavior</h3>
-
-          <div class="setting-row">
-            <label>Auto-lock</label>
-            <input type="checkbox" .checked=${!!autoLockOn}
-              @change=${(e) => this._stageSettingLockModeBit(1, e.target.checked)}
-              ?disabled=${this._busy} />
-          </div>
-
-          <div class="setting-row">
-            <div>
-              <label>Away mode</label>
-              <div class="setting-hint">Requires both PIN and RFID to unlock</div>
-            </div>
-            <input type="checkbox" .checked=${!!awayModeOn}
-              @change=${(e) => this._stageSettingLockModeBit(2, e.target.checked)}
-              ?disabled=${this._busy} />
-          </div>
-
-          <div class="setting-row">
-            <label>Auto-relock</label>
-            <input type="checkbox" .checked=${val("relock_enabled", false)}
-              @change=${(e) => this._stageSetting("relock_enabled", e.target.checked)}
-              ?disabled=${this._busy} />
-            <span class="setting-hint">Re-locks if unlocked but the door was never opened</span>
-          </div>
-
-          <div class="setting-row">
-            <label>Service PIN</label>
-            <select .value=${String(svcMode)}
-              @change=${(e) => this._stageSetting("service_pin_mode", parseInt(e.target.value))}
-              ?disabled=${this._busy}>
-              ${servicePinOptions.map(o => html`
-                <option value=${o.value} ?selected=${svcMode === o.value}>${o.label}</option>
-              `)}
-            </select>
-          </div>
-          ${svcMode === 5 || svcMode === 6 ? html`
-            <div class="setting-info">
-              <p>To see the random PIN, enter <strong>[Master PIN] + [*] + [8]</strong> on the lock keypad.</p>
-            </div>
+          ${!mfrSupported ? html`
+            <p class="setting-hint" style="margin-top:8px">Some settings are not available on this lock firmware.</p>
           ` : ""}
         </div>
+
+        ${mfrSupported ? html`
+          <div class="setting-group">
+            <h3>Lock behavior</h3>
+
+            <div class="setting-row">
+              <label>Auto-lock</label>
+              <input type="checkbox" .checked=${!!autoLockOn}
+                @change=${(e) => this._stageSettingLockModeBit(1, e.target.checked)}
+                ?disabled=${this._busy} />
+            </div>
+
+            <div class="setting-row">
+              <div>
+                <label>Away mode</label>
+                <div class="setting-hint">Requires both PIN and RFID to unlock</div>
+              </div>
+              <input type="checkbox" .checked=${!!awayModeOn}
+                @change=${(e) => this._stageSettingLockModeBit(2, e.target.checked)}
+                ?disabled=${this._busy} />
+            </div>
+
+            <div class="setting-row">
+              <label>Auto-relock</label>
+              <input type="checkbox" .checked=${val("relock_enabled", false)}
+                @change=${(e) => this._stageSetting("relock_enabled", e.target.checked)}
+                ?disabled=${this._busy} />
+              <span class="setting-hint">Re-locks if unlocked but the door was never opened</span>
+            </div>
+
+            <div class="setting-row">
+              <label>Service PIN</label>
+              <select .value=${String(svcMode)}
+                @change=${(e) => this._stageSetting("service_pin_mode", parseInt(e.target.value))}
+                ?disabled=${this._busy}>
+                ${servicePinOptions.map(o => html`
+                  <option value=${o.value} ?selected=${svcMode === o.value}>${o.label}</option>
+                `)}
+              </select>
+            </div>
+            ${svcMode === 5 || svcMode === 6 ? html`
+              <div class="setting-info">
+                <p>To see the random PIN, enter <strong>[Master PIN] + [*] + [8]</strong> on the lock keypad.</p>
+              </div>
+            ` : ""}
+          </div>
+        ` : ""}
 
         <div class="setting-group">
           <h3>Device info</h3>
