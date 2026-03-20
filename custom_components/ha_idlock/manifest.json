@@ -3,7 +3,7 @@
   "name": "ID Lock Manager",
   "documentation": "https://github.com/arildj2/ha-idlock",
   "dependencies": ["zha", "websocket_api", "http", "frontend"],
-  "codeowners": ["@arildj"],
+  "codeowners": ["@arildj2"],
   "config_flow": true,
   "iot_class": "local_push",
   "version": "0.1.0"
