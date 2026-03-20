@@ -475,7 +475,9 @@ async def ws_debug_read_slot(
 async def ws_debug_read_mfr_attrs(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
 ) -> None:
-    """Debug: read manufacturer-specific attributes using raw ZCL method."""
+    """Debug: try multiple strategies to read manufacturer-specific attributes."""
+    import asyncio
+
     result = await _get_lock_and_device(hass, connection, msg, require_device=True)
     if not result:
         return
@@ -483,66 +485,106 @@ async def ws_debug_read_mfr_attrs(
 
     from .const import (
         ATTR_AUDIO_VOLUME,
+        ATTR_LOCK_FW_VERSION,
         ATTR_LOCK_MODE,
         ATTR_MASTER_PIN_MODE,
         ATTR_RELOCK_ENABLED,
         ATTR_RFID_ENABLED,
         ATTR_SERVICE_PIN_MODE,
+        BASIC_CLUSTER_ID,
         IDLOCK_MANUFACTURER_CODE,
     )
 
     cluster = device._cluster  # noqa: SLF001
-    debug: dict[str, Any] = {
-        "ieee": device.ieee,
-        "manufacturer_code": IDLOCK_MANUFACTURER_CODE,
-        "cluster_type": type(cluster).__name__,
-        "attributes_type": type(cluster.attributes).__name__,
-        "has_read_attributes_raw": hasattr(cluster, "read_attributes_raw"),
-        "has__read_attributes": hasattr(cluster, "_read_attributes"),
-    }
+    zigpy_dev = device._zigpy_device  # noqa: SLF001
+    debug: dict[str, Any] = {"ieee": device.ieee}
 
-    attr_ids = [
-        ATTR_MASTER_PIN_MODE, ATTR_RFID_ENABLED, ATTR_SERVICE_PIN_MODE,
-        ATTR_LOCK_MODE, ATTR_RELOCK_ENABLED, ATTR_AUDIO_VOLUME,
-    ]
-    attr_hex = {a: f"0x{a:04X}" for a in attr_ids}
+    # Find Basic cluster
+    basic_cluster = None
+    if zigpy_dev:
+        for ep_id, ep in zigpy_dev.endpoints.items():
+            if ep_id == 0:
+                continue
+            if BASIC_CLUSTER_ID in ep.in_clusters:
+                basic_cluster = ep.in_clusters[BASIC_CLUSTER_ID]
+                break
 
-    # Method 1: Try _read_attributes (internal, returns raw records)
+    # Test 1: Standard sound_volume read (should always work)
     try:
-        raw_result = await cluster._read_attributes(  # noqa: SLF001
-            attr_ids,
-            manufacturer=IDLOCK_MANUFACTURER_CODE,
-        )
-        debug["method_raw"] = {}
-        if isinstance(raw_result, (list, tuple)):
-            for record in raw_result[0] if raw_result else []:
-                aid = getattr(record, "attrid", None)
-                status = getattr(record, "status", None)
-                value_obj = getattr(record, "value", None)
-                val = getattr(value_obj, "value", None) if value_obj else None
-                key = attr_hex.get(aid, repr(aid))
-                debug["method_raw"][key] = {
-                    "status": repr(status),
-                    "value": repr(val),
-                    "raw": repr(record),
-                }
-        else:
-            debug["method_raw"]["raw_repr"] = repr(raw_result)
+        r = await cluster.read_attributes(["sound_volume"])
+        attrs = r[0] if isinstance(r, (list, tuple)) else r
+        debug["test1_sound_volume"] = repr(attrs.get("sound_volume"))
     except Exception as e:  # noqa: BLE001
-        debug["method_raw_error"] = f"{type(e).__name__}: {e}"
+        debug["test1_sound_volume_error"] = f"{type(e).__name__}: {e}"
 
-    # Method 2: Try read_attributes_raw (if it exists)
-    if hasattr(cluster, "read_attributes_raw"):
+    # Test 2: All mfr attrs at once with manufacturer code (current approach)
+    all_mfr = [ATTR_MASTER_PIN_MODE, ATTR_RFID_ENABLED, ATTR_SERVICE_PIN_MODE,
+               ATTR_LOCK_MODE, ATTR_RELOCK_ENABLED, ATTR_AUDIO_VOLUME]
+    try:
+        r = await asyncio.wait_for(
+            cluster._read_attributes(all_mfr, manufacturer=IDLOCK_MANUFACTURER_CODE),  # noqa: SLF001
+            timeout=10,
+        )
+        debug["test2_all_mfr_with_code"] = _parse_raw_records(r)
+    except Exception as e:  # noqa: BLE001
+        debug["test2_all_mfr_with_code_error"] = f"{type(e).__name__}: {e}"
+
+    # Test 3: Single mfr attr (0x4000) with manufacturer code
+    try:
+        r = await asyncio.wait_for(
+            cluster._read_attributes([ATTR_MASTER_PIN_MODE], manufacturer=IDLOCK_MANUFACTURER_CODE),  # noqa: SLF001
+            timeout=10,
+        )
+        debug["test3_single_0x4000_with_code"] = _parse_raw_records(r)
+    except Exception as e:  # noqa: BLE001
+        debug["test3_single_0x4000_with_code_error"] = f"{type(e).__name__}: {e}"
+
+    # Test 4: Single mfr attr (0x4000) WITHOUT manufacturer code
+    try:
+        r = await asyncio.wait_for(
+            cluster._read_attributes([ATTR_MASTER_PIN_MODE]),  # noqa: SLF001
+            timeout=10,
+        )
+        debug["test4_single_0x4000_no_code"] = _parse_raw_records(r)
+    except Exception as e:  # noqa: BLE001
+        debug["test4_single_0x4000_no_code_error"] = f"{type(e).__name__}: {e}"
+
+    # Test 5: Lock firmware from Basic cluster 0x5000
+    if basic_cluster:
         try:
-            raw_result = await cluster.read_attributes_raw(
-                attr_ids,
-                manufacturer=IDLOCK_MANUFACTURER_CODE,
+            r = await asyncio.wait_for(
+                basic_cluster._read_attributes([ATTR_LOCK_FW_VERSION], manufacturer=IDLOCK_MANUFACTURER_CODE),  # noqa: SLF001
+                timeout=10,
             )
-            debug["method_raw2"] = repr(raw_result)[:500]
+            debug["test5_lock_fw_0x5000"] = _parse_raw_records(r)
         except Exception as e:  # noqa: BLE001
-            debug["method_raw2_error"] = f"{type(e).__name__}: {e}"
+            debug["test5_lock_fw_0x5000_error"] = f"{type(e).__name__}: {e}"
+
+    # Test 6: Basic cluster build_id (0x4000) — standard, no mfr code
+    if basic_cluster:
+        try:
+            r = await basic_cluster.read_attributes(["build_id"])
+            attrs = r[0] if isinstance(r, (list, tuple)) else r
+            debug["test6_basic_build_id"] = repr(attrs.get("build_id"))
+        except Exception as e:  # noqa: BLE001
+            debug["test6_basic_build_id_error"] = f"{type(e).__name__}: {e}"
 
     connection.send_result(msg["id"], debug)
+
+
+def _parse_raw_records(raw_result: Any) -> dict[str, Any]:
+    """Parse raw attribute read result into a debug-friendly dict."""
+    parsed: dict[str, Any] = {}
+    if not isinstance(raw_result, (list, tuple)) or not raw_result:
+        return {"raw": repr(raw_result)[:300]}
+    for record in raw_result[0]:
+        aid = getattr(record, "attrid", None)
+        status = getattr(record, "status", None)
+        value_obj = getattr(record, "value", None)
+        val = getattr(value_obj, "value", None) if value_obj else None
+        key = f"0x{aid:04X}" if aid is not None else repr(aid)
+        parsed[key] = {"status": repr(status), "value": repr(val)}
+    return parsed
 
 
 def register_ws_handlers(hass: HomeAssistant) -> None:
