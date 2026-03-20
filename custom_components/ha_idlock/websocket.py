@@ -352,6 +352,11 @@ async def ws_read_all_codes(
             found_rfids += 1
 
     _LOGGER.info("[IDLock] Found %d PINs and %d RFIDs on %s", found_pins, found_rfids, lock.name)
+
+    # Lock is confirmed awake after successful slot scan — try reading settings
+    # if we haven't loaded them yet (helps sleepy locks that timeout on cold reads)
+    await device.async_try_read_settings_opportunistic()
+
     await store.async_save()
     connection.send_result(msg["id"], _lock_to_dict(lock))
 
@@ -440,6 +445,9 @@ async def ws_read_pin(
     if pin_data is None:
         connection.send_error(msg["id"], "device_error", f"Failed to read slot {slot}")
         return
+
+    # Lock is awake — opportunistically load settings in background
+    hass.async_create_task(device.async_try_read_settings_opportunistic())
 
     connection.send_result(msg["id"], {"slot": slot, "code": pin_data.get("code")})
 

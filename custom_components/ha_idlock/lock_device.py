@@ -226,15 +226,23 @@ class IDLockDevice:
         except Exception:  # noqa: BLE001
             _LOGGER.debug("[IDLock] Could not read capabilities for %s", self.ieee)
 
-    async def _read_idlock_attributes(self) -> None:
+    async def _read_idlock_attributes(self, timeout: float = 15.0) -> None:
         """Read IDLock manufacturer-specific attributes (0x4000-0x4006).
 
         These require the Datek manufacturer code (4919) to be passed.
         Also reads the standard sound_volume (0x0024) as fallback for audio.
+
+        Uses an explicit timeout to fail fast on sleepy locks that don't
+        respond to attribute reads (the lock may only respond to commands).
         """
+        import asyncio
+
         # Read standard sound_volume first (known to work from diagnostic)
         try:
-            result = await self._cluster.read_attributes(["sound_volume"])
+            result = await asyncio.wait_for(
+                self._cluster.read_attributes(["sound_volume"]),
+                timeout=timeout,
+            )
             attrs = result[0] if isinstance(result, (list, tuple)) else result
             if "sound_volume" in attrs and attrs["sound_volume"] is not None:
                 self.audio_volume = int(attrs["sound_volume"])
@@ -253,9 +261,12 @@ class IDLockDevice:
             ATTR_AUDIO_VOLUME,
         ]
         try:
-            raw_result = await self._cluster._read_attributes(  # noqa: SLF001
-                mfr_attr_ids,
-                manufacturer=IDLOCK_MANUFACTURER_CODE,
+            raw_result = await asyncio.wait_for(
+                self._cluster._read_attributes(  # noqa: SLF001
+                    mfr_attr_ids,
+                    manufacturer=IDLOCK_MANUFACTURER_CODE,
+                ),
+                timeout=timeout,
             )
             # _read_attributes returns (list_of_records, ...) — parse attribute records
             records = raw_result[0] if isinstance(raw_result, (list, tuple)) else []
@@ -300,10 +311,23 @@ class IDLockDevice:
         except Exception:  # noqa: BLE001
             self.mfr_attrs_supported = False
             _LOGGER.warning(
-                "[IDLock] Could not read manufacturer attributes for %s (timeout or unsupported firmware)",
+                "[IDLock] Could not read manufacturer attributes for %s (lock may be asleep)",
                 self.ieee,
-                exc_info=True,
             )
+
+    async def async_try_read_settings_opportunistic(self) -> bool:
+        """Try reading settings with a short timeout — call when lock is known awake.
+
+        Returns True if mfr attributes were successfully read.
+        Skips if already loaded or previously confirmed unsupported.
+        """
+        if self.mfr_attrs_supported is True:
+            return True  # Already loaded
+        if not self._cluster:
+            return False
+        _LOGGER.debug("[IDLock] %s: opportunistic settings read (lock should be awake)", self.ieee)
+        await self._read_idlock_attributes(timeout=8.0)
+        return self.mfr_attrs_supported is True
 
     def get_device_info(self) -> dict[str, Any]:
         """Return all device info for the panel/diagnostics."""
