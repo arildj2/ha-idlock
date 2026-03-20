@@ -1,7 +1,7 @@
 {
   "domain": "ha_idlock",
   "name": "ID Lock Manager",
-  "documentation": "https://github.com/arildj/ha-idlock",
+  "documentation": "https://github.com/arildj2/ha-idlock",
   "dependencies": ["zha", "websocket_api", "http", "frontend"],
   "codeowners": ["@arildj"],
   "config_flow": true,
