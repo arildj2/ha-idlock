@@ -309,6 +309,6 @@ MIT
 
 Built with insights from:
 - [keymaster](https://github.com/FutureTense/keymaster) — Z-Wave lock manager (provider architecture reference)
-- [zha_lock_manager](https://github.com/FutureTense/zha_lock_manager) — ZHA lock manager (panel UI reference)
+- [zha_lock_manager](https://github.com/dmoralesdev/zha_lock_manager/) — ZHA lock manager (panel UI reference)
 - [zha-toolkit](https://github.com/mdeweerd/zha-toolkit) — Manufacturer attribute write pattern
 - [Datek IDLock Zigbee specifications](https://idlock.no/zigbee) — Official technical documentation
