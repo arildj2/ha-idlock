@@ -329,6 +329,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unsub := hass.data.get(DOMAIN, {}).pop("unsub_zha_event", None):
         unsub()
 
+    # Clear cached device connections so reload gets fresh ones
+    hass.data.get(DOMAIN, {}).pop("devices", None)
+
     return unload_ok
 
 
