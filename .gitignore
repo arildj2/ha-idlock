@@ -1,0 +1,37 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.eggs/
+*.egg
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+coverage.xml
+htmlcov/
+.coverage
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Device diagnostic dumps
+idlock-*.json
+
+# Reference implementations (not part of this project)
+keymaster
+keymaster/
+keymaster-0.2.1/
+zha_lock_manager
+zha_lock_manager/
+zha_lock_manager-0.4.2/
+*.tar.gz
+
+# Project notes (local only)
+*.local.md
+CLAUDE.md

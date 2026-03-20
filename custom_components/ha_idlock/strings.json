@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Select ID Lock devices",
+        "data": {
+          "locks": "ZHA lock entities"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "main": {
+        "title": "ID Lock Settings",
+        "data": {
+          "locks": "ZHA lock entities"
+        }
+      }
+    }
+  }
+}
