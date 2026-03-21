@@ -71,7 +71,7 @@ PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 # Frontend / panel
 PANEL_URL_BASE = "/ha-idlock-frontend"
-PANEL_MODULE_URL = f"{PANEL_URL_BASE}/ha_idlock_panel.js?v=29"
+PANEL_MODULE_URL = f"{PANEL_URL_BASE}/ha_idlock_panel.js?v=30"
 PANEL_PATH = "frontend"
 PANEL_TITLE = "ID Lock"
 PANEL_ICON = "mdi:lock-smart"
