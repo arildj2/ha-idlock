@@ -9,6 +9,7 @@ from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from .const import CONF_LOCKS, DOMAIN, EVENT_IDLOCK, EVENT_IDLOCK_CODE_CHANGED
 
@@ -34,6 +35,7 @@ async def async_setup_entry(
 
         entities.append(IDLockLastEventSensor(ieee, name, entity_id))
         entities.append(IDLockCodeChangeSensor(ieee, name, entity_id))
+        entities.append(IDLockLastPersonSensor(ieee, name, entity_id))
 
     if entities:
         async_add_entities(entities)
@@ -146,6 +148,76 @@ class IDLockCodeChangeSensor(SensorEntity):
             self.async_write_ha_state()
 
         self._unsub = self.hass.bus.async_listen(EVENT_IDLOCK_CODE_CHANGED, _handle_event)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Unsubscribe on removal."""
+        if self._unsub:
+            self._unsub()
+
+
+class IDLockLastPersonSensor(SensorEntity):
+    """Sensor showing who last opened the door, resolved from slot labels."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:account-lock"
+
+    def __init__(self, ieee: str, lock_name: str, lock_entity_id: str) -> None:
+        """Initialize last person sensor for a lock."""
+        self._ieee = ieee
+        self._lock_entity_id = lock_entity_id
+        self._attr_unique_id = f"{DOMAIN}_{ieee}_last_person"
+        self._attr_name = f"{lock_name} last person"
+        self._attr_native_value: str | None = None
+        self._event_data: dict[str, Any] = {}
+        self._unsub: Any = None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return event details as attributes."""
+        return self._event_data
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to lock events when added."""
+        from .storage import IDLockStore
+
+        @callback
+        def _handle_event(event: Event) -> None:
+            data = event.data
+            if data.get("device_ieee") != self._ieee:
+                return
+
+            source = data.get("source", "unknown")
+            operation = data.get("operation", "unknown")
+            code_slot = data.get("code_slot", 0)
+
+            # Resolve person name from slot label in store
+            person = ""
+            if code_slot > 0:
+                store: IDLockStore | None = self.hass.data.get(DOMAIN, {}).get("store")
+                if store:
+                    lock = store.get_lock(self._ieee)
+                    if lock and code_slot in lock.slots:
+                        person = lock.slots[code_slot].label
+
+            if not person and code_slot > 0:
+                person = f"Slot {code_slot}"
+            elif not person:
+                person = source  # manual, rf, etc.
+
+            now = dt_util.now().isoformat()
+
+            self._attr_native_value = person
+            self._event_data = {
+                "person": person,
+                "operation": operation,
+                "source": source,
+                "code_slot": code_slot,
+                "lock_entity_id": self._lock_entity_id,
+                "last_changed": now,
+            }
+            self.async_write_ha_state()
+
+        self._unsub = self.hass.bus.async_listen(EVENT_IDLOCK, _handle_event)
 
     async def async_will_remove_from_hass(self) -> None:
         """Unsubscribe on removal."""
