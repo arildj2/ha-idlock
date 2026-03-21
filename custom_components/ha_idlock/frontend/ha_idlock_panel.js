@@ -823,7 +823,10 @@ class HaIdlockPanel extends LitElement {
             <h3>Lock behavior</h3>
 
             <div class="setting-row">
-              <label>Auto-lock</label>
+              <div>
+                <label>Auto-lock</label>
+                <div class="setting-hint">Automatically locks after the door is closed</div>
+              </div>
               <input type="checkbox" .checked=${!!autoLockOn}
                 @change=${(e) => this._stageSettingLockModeBit(1, e.target.checked)}
                 ?disabled=${this._busy} />
