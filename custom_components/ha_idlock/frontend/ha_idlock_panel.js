@@ -21,6 +21,7 @@ class HaIdlockPanel extends LitElement {
       _pendingSettings: { type: Object },
       _dirty: { type: Object },
       _revealedPins: { type: Object },
+      _forceRender: { type: Boolean },
     };
   }
 
@@ -36,6 +37,7 @@ class HaIdlockPanel extends LitElement {
     this._dirty = {};  // { slotNum: { label: "...", pin: "..." } }
     this._pendingSettings = {};  // { setting_name: value } — unsaved setting changes
     this._revealedPins = {};  // { slotNum: "1234" | "loading" }
+    this._forceRender = false;
   }
 
   connectedCallback() {
@@ -44,10 +46,14 @@ class HaIdlockPanel extends LitElement {
     // Refresh when returning from idle/sleep/tab switch
     this._visibilityHandler = () => {
       if (document.visibilityState === "visible") {
-        // Delay to let HA's WebSocket reconnect after sleep/idle
+        // Safari aggressively suspends inactive tabs, which can leave the
+        // shadow DOM in a stale/blank state. Force a full re-render by
+        // toggling a reactive property, then refresh data after the WS
+        // has had time to reconnect.
+        this._forceRender = !this._forceRender;
+        this.requestUpdate();
         setTimeout(() => {
           if (this.hass) {
-            this.requestUpdate();
             this._refresh();
           }
         }, 500);
