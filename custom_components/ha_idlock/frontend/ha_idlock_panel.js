@@ -586,7 +586,7 @@ class HaIdlockPanel extends LitElement {
                           class="label-input"
                           .value=${slot.label || ""}
                           placeholder="unnamed"
-                          maxlength="20"
+                          maxlength="30"
                           @input=${(e) => this._handleLabelInput(slot, e)}
                           @keydown=${(e) => this._handleLabelKeydown(slot, e)}
                           ?disabled=${this._busy}
@@ -689,7 +689,7 @@ class HaIdlockPanel extends LitElement {
             class="label-input add-name-input"
             id="add-name"
             placeholder="Name"
-            maxlength="20"
+            maxlength="30"
             ?disabled=${this._busy}
           />
           <input
