@@ -21,7 +21,6 @@ class HaIdlockPanel extends LitElement {
       _pendingSettings: { type: Object },
       _dirty: { type: Object },
       _revealedPins: { type: Object },
-      _forceRender: { type: Boolean },
     };
   }
 
@@ -37,7 +36,6 @@ class HaIdlockPanel extends LitElement {
     this._dirty = {};  // { slotNum: { label: "...", pin: "..." } }
     this._pendingSettings = {};  // { setting_name: value } — unsaved setting changes
     this._revealedPins = {};  // { slotNum: "1234" | "loading" }
-    this._forceRender = false;
   }
 
   connectedCallback() {
@@ -46,12 +44,12 @@ class HaIdlockPanel extends LitElement {
     // Refresh when returning from idle/sleep/tab switch
     this._visibilityHandler = () => {
       if (document.visibilityState === "visible") {
-        // Safari aggressively suspends inactive tabs, which can leave the
-        // shadow DOM in a stale/blank state. Force a full re-render by
-        // toggling a reactive property, then refresh data after the WS
-        // has had time to reconnect.
-        this._forceRender = !this._forceRender;
-        this.requestUpdate();
+        // Safari aggressively suspends inactive tabs, which can blank
+        // the shadow DOM. Lit re-render alone isn't enough — force a
+        // browser-level reflow so Safari repaints the pixels.
+        this.style.display = "none";
+        this.offsetHeight; // force reflow
+        this.style.display = "";
         setTimeout(() => {
           if (this.hass) {
             this._refresh();
@@ -71,12 +69,12 @@ class HaIdlockPanel extends LitElement {
 
   updated(changedProperties) {
     if (changedProperties.has("hass") && this.hass) {
-      // hass gets re-assigned on reconnect — always refresh if we have no data
-      if (this._locks.length === 0) {
+      const prev = changedProperties.get("hass");
+      // Refresh when hass first appears (null → object) — covers reconnect
+      // after suspension where _locks still holds stale data.
+      if (!prev) {
         this._refresh();
       }
-      // Force repaint in case shadow DOM went stale
-      this.requestUpdate();
     }
   }
 

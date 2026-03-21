@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
 import logging
 from typing import Any
 
@@ -193,6 +194,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     unsub = hass.bus.async_listen(EVENT_ZHA, _handle_zha_event)
     hass.data[DOMAIN]["unsub_zha_event"] = unsub
+
+    # Pre-import platform modules in the executor so async_forward_entry_setups
+    # doesn't trigger a blocking import_module call inside the event loop.
+    await hass.async_add_import_executor_job(
+        importlib.import_module, "custom_components.ha_idlock.sensor"
+    )
 
     # Forward to entity platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
