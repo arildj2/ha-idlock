@@ -185,8 +185,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         lock = store.locks[device_ieee]
 
         if command == "operation_event_notification":
+            _LOGGER.debug("[IDLock] operation_event args: %s", args)
             _handle_operation_event(hass, lock, device_ieee, args)
         elif command == "programming_event_notification":
+            _LOGGER.debug("[IDLock] programming_event args: %s", args)
             _handle_programming_event(hass, store, lock, device_ieee, args)
 
     unsub = hass.bus.async_listen(EVENT_ZHA, _handle_zha_event)
@@ -205,14 +207,21 @@ def _handle_operation_event(
     args: dict[str, Any],
 ) -> None:
     """Handle operation_event_notification (lock/unlock events)."""
-    source = _parse_value(args.get("operation_event_source"), _SOURCE_MAP)
-    operation = _parse_value(args.get("operation_event_code"), _OPERATION_MAP)
-    user_id = args.get("user_id")
+    # ZHA ≥2025.x uses string keys: source, operation, code_slot
+    # Older ZHA uses integer keys: operation_event_source, operation_event_code, user_id
+    if "source" in args:
+        source = str(args["source"]).lower()
+        operation = str(args.get("operation", "unknown")).lower()
+        raw_slot = args.get("code_slot")
+    else:
+        source = _parse_value(args.get("operation_event_source"), _SOURCE_MAP)
+        operation = _parse_value(args.get("operation_event_code"), _OPERATION_MAP)
+        raw_slot = args.get("user_id")
 
     code_slot = 0
-    if user_id is not None and source in ("keypad", "rfid"):
+    if raw_slot is not None and source in ("keypad", "rfid"):
         try:
-            code_slot = int(user_id)  # IDLock reports 1-based slot numbers
+            code_slot = int(raw_slot)  # IDLock reports 1-based slot numbers
         except (ValueError, TypeError):
             code_slot = 0
 
@@ -241,15 +250,35 @@ def _handle_programming_event(
     Fired by the lock when codes are modified via keypad, RF, or other means.
     Updates our store to stay in sync without polling.
     """
-    source = _parse_value(args.get("program_event_source"), _SOURCE_MAP)
-    event_code_raw = args.get("program_event_code")
-    user_id = args.get("user_id")
-    try:
-        event_code = int(event_code_raw) if event_code_raw is not None else 0
-    except (ValueError, TypeError):
-        event_code = 0
-
-    event_name = _PROG_EVENT_MAP.get(event_code, "unknown")
+    # ZHA ≥2025.x uses string keys: source, event, code_slot
+    # Older ZHA uses integer keys: program_event_source, program_event_code, user_id
+    if "source" in args:
+        source = str(args["source"]).lower()
+        event_code_raw = args.get("event") or args.get("program_event_code")
+        user_id = args.get("code_slot") if args.get("code_slot") is not None else args.get("user_id")
+    else:
+        source = _parse_value(args.get("program_event_source"), _SOURCE_MAP)
+        event_code_raw = args.get("program_event_code")
+        user_id = args.get("user_id")
+    # New ZHA may send string event names (e.g. "PinAdded") instead of int codes
+    _PROG_EVENT_STR_MAP = {
+        "mastercodechanged": (PROG_EVENT_MASTER_CODE_CHANGED, "master_code_changed"),
+        "pinadded": (PROG_EVENT_PIN_ADDED, "pin_added"),
+        "pindeleted": (PROG_EVENT_PIN_DELETED, "pin_deleted"),
+        "pinchanged": (PROG_EVENT_PIN_CHANGED, "pin_changed"),
+        "rfidadded": (PROG_EVENT_RFID_ADDED, "rfid_added"),
+        "rfiddeleted": (PROG_EVENT_RFID_DELETED, "rfid_deleted"),
+    }
+    if isinstance(event_code_raw, str) and not event_code_raw.isdigit():
+        matched = _PROG_EVENT_STR_MAP.get(event_code_raw.lower().replace("_", ""), (0, event_code_raw.lower()))
+        event_code = matched[0]
+        event_name = matched[1]
+    else:
+        try:
+            event_code = int(event_code_raw) if event_code_raw is not None else 0
+        except (ValueError, TypeError):
+            event_code = 0
+        event_name = _PROG_EVENT_MAP.get(event_code, "unknown")
 
     # IDLock reports 1-based slot numbers in events
     slot = 0

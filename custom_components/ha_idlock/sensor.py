@@ -7,8 +7,10 @@ from typing import Any
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import STATE_LOCKED, STATE_UNLOCKED
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.util import dt as dt_util
 
 from .const import CONF_LOCKS, DOMAIN, EVENT_IDLOCK, EVENT_IDLOCK_CODE_CHANGED
@@ -161,6 +163,11 @@ class IDLockLastPersonSensor(SensorEntity):
     _attr_has_entity_name = True
     _attr_icon = "mdi:account-lock"
 
+    # Grace period (seconds) to wait for an operation event after a state change.
+    # If the lock fires both, the operation event arrives first and sets the person;
+    # the state change then arrives within this window and is ignored.
+    _STATE_GRACE_SECONDS = 2.0
+
     def __init__(self, ieee: str, lock_name: str, lock_entity_id: str) -> None:
         """Initialize last person sensor for a lock."""
         self._ieee = ieee
@@ -169,19 +176,42 @@ class IDLockLastPersonSensor(SensorEntity):
         self._attr_name = f"{lock_name} last person"
         self._attr_native_value: str | None = None
         self._event_data: dict[str, Any] = {}
-        self._unsub: Any = None
+        self._unsub_event: Any = None
+        self._unsub_state: Any = None
+        self._last_event_time: float = 0.0
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return event details as attributes."""
         return self._event_data
 
+    def _update_person(
+        self,
+        person: str,
+        operation: str,
+        source: str,
+        code_slot: int,
+    ) -> None:
+        """Update sensor state with person info."""
+        now = dt_util.now().isoformat()
+        self._attr_native_value = person
+        self._event_data = {
+            "person": person,
+            "operation": operation,
+            "source": source,
+            "code_slot": code_slot,
+            "lock_entity_id": self._lock_entity_id,
+            "last_changed": now,
+        }
+        self.async_write_ha_state()
+
     async def async_added_to_hass(self) -> None:
-        """Subscribe to lock events when added."""
+        """Subscribe to lock events and state changes."""
         from .storage import IDLockStore
 
         @callback
         def _handle_event(event: Event) -> None:
+            """Handle operation_event_notification with full details."""
             data = event.data
             if data.get("device_ieee") != self._ieee:
                 return
@@ -202,24 +232,42 @@ class IDLockLastPersonSensor(SensorEntity):
             if not person and code_slot > 0:
                 person = f"Slot {code_slot}"
             elif not person:
-                person = source  # manual, rf, etc.
+                person = source
 
-            now = dt_util.now().isoformat()
+            self._last_event_time = dt_util.utcnow().timestamp()
+            self._update_person(person, operation, source, code_slot)
 
-            self._attr_native_value = person
-            self._event_data = {
-                "person": person,
-                "operation": operation,
-                "source": source,
-                "code_slot": code_slot,
-                "lock_entity_id": self._lock_entity_id,
-                "last_changed": now,
-            }
-            self.async_write_ha_state()
+        @callback
+        def _handle_state_change(event: Event) -> None:
+            """Fallback: update with 'unknown' when lock state changes without an operation event."""
+            new_state = event.data.get("new_state")
+            old_state = event.data.get("old_state")
+            if not new_state or not old_state:
+                return
 
-        self._unsub = self.hass.bus.async_listen(EVENT_IDLOCK, _handle_event)
+            new_val = new_state.state
+            old_val = old_state.state
+            if new_val not in (STATE_LOCKED, STATE_UNLOCKED):
+                return
+            if new_val == old_val:
+                return
+
+            # Skip if we just got an operation event within the grace period
+            now_ts = dt_util.utcnow().timestamp()
+            if now_ts - self._last_event_time < self._STATE_GRACE_SECONDS:
+                return
+
+            operation = "unlock" if new_val == STATE_UNLOCKED else "lock"
+            self._update_person("unknown", operation, "unknown", 0)
+
+        self._unsub_event = self.hass.bus.async_listen(EVENT_IDLOCK, _handle_event)
+        self._unsub_state = async_track_state_change_event(
+            self.hass, [self._lock_entity_id], _handle_state_change
+        )
 
     async def async_will_remove_from_hass(self) -> None:
         """Unsubscribe on removal."""
-        if self._unsub:
-            self._unsub()
+        if self._unsub_event:
+            self._unsub_event()
+        if self._unsub_state:
+            self._unsub_state()
