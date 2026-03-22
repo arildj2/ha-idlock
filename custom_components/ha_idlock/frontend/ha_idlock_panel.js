@@ -1175,7 +1175,7 @@ class HaIdlockPanel extends LitElement {
         color: var(--primary-text-color);
         font-size: 14px;
         padding: 4px 2px;
-        width: 100%;
+        width: 30ch;
         outline: none;
         transition: border-color 0.15s;
       }
