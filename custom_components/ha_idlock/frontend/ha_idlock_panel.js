@@ -435,11 +435,6 @@ class HaIdlockPanel extends LitElement {
       <div class="container ${this.isMobile ? "mobile" : "desktop"}">
         <div class="header">
           <h1>ID Lock Manager</h1>
-          <div class="header-actions">
-            <button @click=${this._refresh} ?disabled=${this._busy}>
-              Refresh
-            </button>
-          </div>
         </div>
 
         ${this._error
@@ -922,13 +917,6 @@ class HaIdlockPanel extends LitElement {
         border-bottom: 1px solid var(--divider-color, #e0e0e0);
       }
       .header h1 { margin: 0; font-size: 24px; }
-      .header-actions button {
-        padding: 8px 16px;
-        border-radius: 8px;
-        border: 1px solid var(--divider-color, #ccc);
-        background: var(--card-background-color, #fff);
-        cursor: pointer;
-      }
 
       .error {
         background: var(--error-color, #db4437);
