@@ -97,6 +97,11 @@ class IDLockDevice:
         """Return True if cluster is available."""
         return self._cluster is not None
 
+    @property
+    def info_loaded(self) -> bool:
+        """Return True if device info has been read at least once."""
+        return self.mfr_attrs_supported is not None
+
     async def async_connect(self) -> bool:
         """Connect to the zigpy device and locate the DoorLock cluster.
 
@@ -342,6 +347,7 @@ class IDLockDevice:
         return {
             "ieee": self.ieee,
             "connected": self.connected,
+            "info_loaded": self.info_loaded,
             "lock_firmware": self.lock_firmware,
             "module_build": self.module_build,
             "mfr_attrs_supported": self.mfr_attrs_supported,

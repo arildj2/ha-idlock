@@ -740,6 +740,13 @@ class HaIdlockPanel extends LitElement {
         </div>`
       : "";
 
+    if (!s.info_loaded) {
+      return html`
+        ${fwInfo}
+        <p class="setting-hint">Settings will be available after the lock wakes up (open/close the door or enter a code).</p>
+      `;
+    }
+
     const mfrSupported = s.mfr_attrs_supported !== false;
 
     // Use pending value if staged, otherwise device value
