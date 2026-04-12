@@ -363,6 +363,11 @@ class HaIdlockPanel extends LitElement {
     this._pendingSettings = {};
     this._revealedPins = {};
     this._error = "";
+    // Force-clear any PIN inputs that Lit's .value binding won't reset
+    // (binding "" → "" is a no-op, but the DOM input retains its old value)
+    this.updateComplete.then(() => {
+      this.shadowRoot.querySelectorAll(".pin-input").forEach(el => { el.value = ""; });
+    });
     this._loadSettings(lock.device_ieee);
   }
 
