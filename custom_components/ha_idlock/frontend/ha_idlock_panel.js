@@ -528,6 +528,16 @@ class HaIdlockPanel extends LitElement {
 
   _renderLockDetail() {
     const lock = this._selected;
+
+    if (!this._settings) {
+      return html`
+        <div class="detail-header"><h2>${lock.name}</h2></div>
+        <div style="display:flex;align-items:center;gap:8px;padding:24px 0;color:var(--secondary-text-color)">
+          <span class="spinner"></span> Loading settings…
+        </div>
+      `;
+    }
+
     const slots = Object.values(lock.slots || {}).sort(
       (a, b) => a.slot - b.slot
     );
@@ -735,13 +745,6 @@ class HaIdlockPanel extends LitElement {
           ${s.module_build ? html`<span class="fw-badge">Zigbee module: ${s.module_build}</span>` : ""}
         </div>`
       : "";
-
-    if (!s.info_loaded) {
-      return html`
-        ${fwInfo}
-        <p class="setting-hint">Settings will be available after the lock wakes up (open/close the door or enter a code).</p>
-      `;
-    }
 
     const mfrSupported = s.mfr_attrs_supported !== false;
 
