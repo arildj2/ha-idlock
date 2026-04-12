@@ -333,11 +333,6 @@ class HaIdlockPanel extends LitElement {
       });
       const code = result.code || "";
       this._revealedPins = { ...this._revealedPins, [slotNum]: code };
-      // Put the PIN into the input field without marking dirty
-      const pinInput = this.shadowRoot.querySelector(`#pin-${slotNum}`);
-      if (pinInput) {
-        pinInput.value = code;
-      }
     } catch (e) {
       this._revealedPins = { ...this._revealedPins, [slotNum]: "error" };
       this._error = e.message || "Failed to read PIN";
@@ -618,6 +613,7 @@ class HaIdlockPanel extends LitElement {
                             pattern="[0-9]*"
                             class="pin-input" autocomplete="off"
                             id="pin-${slot.slot}"
+                            .value=${this._dirty[slot.slot]?.pin ?? (this._revealedPins[slot.slot]?.match?.(/^\d+$/) ? this._revealedPins[slot.slot] : "")}
                             placeholder="${slot.has_code ? "new PIN" : "set PIN"}"
                             @input=${(e) => { e.target.value = e.target.value.replace(/\D/g, ""); this._handlePinInput(slot, e); }}
                             @keydown=${(e) => this._handlePinKeydown(slot, e)}
