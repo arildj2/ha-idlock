@@ -3,6 +3,7 @@ import {
   html,
   css,
 } from "https://unpkg.com/lit-element@4.1.1/lit-element.js?module";
+import { live } from "https://unpkg.com/lit@3.2.1/directives/live.js?module";
 
 class HaIdlockPanel extends LitElement {
   static get properties() {
@@ -363,11 +364,6 @@ class HaIdlockPanel extends LitElement {
     this._pendingSettings = {};
     this._revealedPins = {};
     this._error = "";
-    // Force-clear any PIN inputs that Lit's .value binding won't reset
-    // (binding "" → "" is a no-op, but the DOM input retains its old value)
-    this.updateComplete.then(() => {
-      this.shadowRoot.querySelectorAll(".pin-input").forEach(el => { el.value = ""; });
-    });
     this._loadSettings(lock.device_ieee);
   }
 
@@ -624,7 +620,7 @@ class HaIdlockPanel extends LitElement {
                             pattern="[0-9]*"
                             class="pin-input" autocomplete="off"
                             id="pin-${slot.slot}"
-                            .value=${this._dirty[slot.slot]?.pin ?? (this._revealedPins[slot.slot]?.match?.(/^\d+$/) ? this._revealedPins[slot.slot] : "")}
+                            .value=${live(this._dirty[slot.slot]?.pin ?? (this._revealedPins[slot.slot]?.match?.(/^\d+$/) ? this._revealedPins[slot.slot] : ""))}
                             placeholder="${slot.has_code ? "new PIN" : "set PIN"}"
                             @input=${(e) => { e.target.value = e.target.value.replace(/\D/g, ""); this._handlePinInput(slot, e); }}
                             @keydown=${(e) => this._handlePinKeydown(slot, e)}
