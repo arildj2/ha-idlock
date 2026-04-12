@@ -249,6 +249,7 @@ class HaIdlockPanel extends LitElement {
   }
 
   async _commitRow(slot) {
+    if (this._busy) return;
     const d = this._dirty[slot.slot];
     if (!d) return;
 
@@ -1300,7 +1301,7 @@ class HaIdlockPanel extends LitElement {
 
       .empty { color: var(--secondary-text-color, #999); font-style: italic; }
 
-      @media (max-width: 600px) {
+      @media (max-width: 900px) {
         .meta-section { flex-direction: column; align-items: stretch; }
         .slot-actions { display: flex; flex-wrap: wrap; gap: 4px; }
       }

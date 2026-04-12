@@ -28,6 +28,12 @@ from .storage import IDLockStore
 
 _LOGGER = logging.getLogger(__name__)
 
+# Slot number must be 1-based, upper bound checked per-lock
+SLOT_SCHEMA = vol.All(int, vol.Range(min=1))
+
+# PIN code must be 4-10 digits
+PIN_CODE_SCHEMA = vol.All(str, vol.Match(r"^\d{4,10}$"))
+
 
 def _get_store(hass: HomeAssistant) -> IDLockStore | None:
     """Get the store, or None if not loaded."""
@@ -126,9 +132,9 @@ async def ws_get_lock(
     {
         vol.Required("type"): WS_SET_CODE,
         vol.Required("device_ieee"): str,
-        vol.Required("slot"): int,
-        vol.Required("code"): str,
-        vol.Optional("label", default=""): str,
+        vol.Required("slot"): SLOT_SCHEMA,
+        vol.Required("code"): PIN_CODE_SCHEMA,
+        vol.Optional("label", default=""): vol.All(str, vol.Length(max=30)),
     }
 )
 @websocket_api.async_response
@@ -156,7 +162,7 @@ async def ws_set_code(
 
 
 @websocket_api.websocket_command(
-    {vol.Required("type"): WS_CLEAR_CODE, vol.Required("device_ieee"): str, vol.Required("slot"): int}
+    {vol.Required("type"): WS_CLEAR_CODE, vol.Required("device_ieee"): str, vol.Required("slot"): SLOT_SCHEMA}
 )
 @websocket_api.async_response
 async def ws_clear_code(
@@ -184,7 +190,7 @@ async def ws_clear_code(
 
 
 @websocket_api.websocket_command(
-    {vol.Required("type"): WS_ENABLE_CODE, vol.Required("device_ieee"): str, vol.Required("slot"): int}
+    {vol.Required("type"): WS_ENABLE_CODE, vol.Required("device_ieee"): str, vol.Required("slot"): SLOT_SCHEMA}
 )
 @websocket_api.async_response
 async def ws_enable_code(
@@ -209,7 +215,7 @@ async def ws_enable_code(
 
 
 @websocket_api.websocket_command(
-    {vol.Required("type"): WS_DISABLE_CODE, vol.Required("device_ieee"): str, vol.Required("slot"): int}
+    {vol.Required("type"): WS_DISABLE_CODE, vol.Required("device_ieee"): str, vol.Required("slot"): SLOT_SCHEMA}
 )
 @websocket_api.async_response
 async def ws_disable_code(
@@ -237,7 +243,7 @@ async def ws_disable_code(
 
 
 @websocket_api.websocket_command(
-    {vol.Required("type"): "idlock/clear_rfid", vol.Required("device_ieee"): str, vol.Required("slot"): int}
+    {vol.Required("type"): "idlock/clear_rfid", vol.Required("device_ieee"): str, vol.Required("slot"): SLOT_SCHEMA}
 )
 @websocket_api.async_response
 async def ws_clear_rfid(
@@ -271,8 +277,8 @@ async def ws_clear_rfid(
     {
         vol.Required("type"): WS_RENAME_CODE,
         vol.Required("device_ieee"): str,
-        vol.Required("slot"): int,
-        vol.Required("label"): str,
+        vol.Required("slot"): SLOT_SCHEMA,
+        vol.Required("label"): vol.All(str, vol.Length(max=30)),
     }
 )
 @websocket_api.async_response
@@ -336,28 +342,34 @@ async def ws_read_all_codes(
 
     _LOGGER.info("[IDLock] Reading all %d slots from %s (PIN + RFID)...", device.num_pin_slots, lock.name)
     all_slots = await device.async_read_all_slots()
-    _LOGGER.info("[IDLock] Read %d slot responses from %s", len(all_slots), lock.name)
+    expected = device.num_pin_slots
+    _LOGGER.info("[IDLock] Read %d/%d slot responses from %s", len(all_slots), expected, lock.name)
 
-    found_pins = 0
-    found_rfids = 0
-    for slot_data in all_slots:
-        slot_num = slot_data["slot"]
-        s = store.ensure_slot(lock, slot_num)
-        s.has_code = slot_data["has_pin"]
-        s.has_rfid = slot_data["has_rfid"]
-        s.enabled = slot_data["pin_enabled"] or slot_data["rfid_enabled"]
-        if slot_data["has_pin"]:
-            found_pins += 1
-        if slot_data["has_rfid"]:
-            found_rfids += 1
+    # Only update store if we got a complete scan — partial data would
+    # overwrite previously known slot states for the missing slots.
+    if len(all_slots) < expected:
+        _LOGGER.warning("[IDLock] Incomplete scan for %s — store not updated", lock.name)
+    else:
+        found_pins = 0
+        found_rfids = 0
+        for slot_data in all_slots:
+            slot_num = slot_data["slot"]
+            s = store.ensure_slot(lock, slot_num)
+            s.has_code = slot_data["has_pin"]
+            s.has_rfid = slot_data["has_rfid"]
+            s.enabled = slot_data["pin_enabled"] or slot_data["rfid_enabled"]
+            if slot_data["has_pin"]:
+                found_pins += 1
+            if slot_data["has_rfid"]:
+                found_rfids += 1
 
-    _LOGGER.info("[IDLock] Found %d PINs and %d RFIDs on %s", found_pins, found_rfids, lock.name)
+        _LOGGER.info("[IDLock] Found %d PINs and %d RFIDs on %s", found_pins, found_rfids, lock.name)
+        await store.async_save()
 
     # Lock is confirmed awake after successful slot scan — try reading settings
     # if we haven't loaded them yet (helps sleepy locks that timeout on cold reads)
     await device.async_try_read_settings_opportunistic()
 
-    await store.async_save()
     connection.send_result(msg["id"], _lock_to_dict(lock))
 
 
@@ -376,9 +388,10 @@ async def ws_get_device_settings(
     if not result:
         return
     _, _, device = result
-    # Read attributes if not loaded yet (e.g. first settings panel open)
+    # Read attributes if not loaded yet (e.g. first settings panel open).
+    # Use a short per-read timeout — the lock is battery-powered and may be asleep.
     if device.mfr_attrs_supported is None:
-        await device.async_read_device_info()
+        await device.async_read_device_info(timeout=8.0)
     connection.send_result(msg["id"], device.get_device_info())
 
 
@@ -428,7 +441,7 @@ async def ws_set_device_setting(
 
 
 @websocket_api.websocket_command(
-    {vol.Required("type"): WS_READ_PIN, vol.Required("device_ieee"): str, vol.Required("slot"): int}
+    {vol.Required("type"): WS_READ_PIN, vol.Required("device_ieee"): str, vol.Required("slot"): SLOT_SCHEMA}
 )
 @websocket_api.async_response
 async def ws_read_pin(
@@ -459,7 +472,7 @@ async def ws_read_pin(
     {
         vol.Required("type"): "idlock/debug_read_slot",
         vol.Required("device_ieee"): str,
-        vol.Required("slot"): int,
+        vol.Required("slot"): SLOT_SCHEMA,
     }
 )
 @websocket_api.async_response

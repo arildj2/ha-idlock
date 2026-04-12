@@ -7,8 +7,6 @@ from typing import Any
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
-STATE_LOCKED = "locked"
-STATE_UNLOCKED = "unlocked"
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
@@ -17,6 +15,9 @@ from homeassistant.util import dt as dt_util
 from .const import CONF_LOCKS, DOMAIN, EVENT_IDLOCK, EVENT_IDLOCK_CODE_CHANGED
 
 _LOGGER = logging.getLogger(__name__)
+
+STATE_LOCKED = "locked"
+STATE_UNLOCKED = "unlocked"
 
 
 async def async_setup_entry(

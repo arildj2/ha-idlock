@@ -32,10 +32,13 @@ def _entity_to_lock_dict(hass: HomeAssistant, entity_id: str) -> dict[str, Any] 
             ieee = idt[1]
             break
 
+    if not ieee:
+        return None
+
     return {
         "name": device.name_by_user or ent.original_name or device.name or ent.entity_id,
         "entity_id": ent.entity_id,
-        "device_ieee": ieee or "",
+        "device_ieee": ieee,
         "max_slots": DEFAULT_NUM_PIN_SLOTS,
     }
 

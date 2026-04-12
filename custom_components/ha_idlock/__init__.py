@@ -124,12 +124,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     for ieee in to_delete:
         del store.locks[ieee]
 
-    # Clean up empty slots from store (leftover from previous offset bug)
-    for lock in store.locks.values():
-        empty_slots = [num for num, s in lock.slots.items() if not s.has_code and not s.has_rfid]
-        for num in empty_slots:
-            del lock.slots[num]
-
     await store.async_save()
 
     # Connect to zigpy devices (local lookups only, no Zigbee traffic).
@@ -162,21 +156,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if data.get("cluster_id") != DOOR_LOCK_CLUSTER_ID:
             return
 
-        # Lock is awake — opportunistically load device info if not yet read
-        device = get_device(hass, device_ieee)
-        if device.connected and not device.info_loaded:
-            hass.async_create_task(device.async_read_device_info())
+        try:
+            # Lock is awake — opportunistically load device info if not yet read
+            device = get_device(hass, device_ieee)
+            if device.connected and not device.info_loaded:
+                hass.async_create_task(device.async_read_device_info())
 
-        command = data.get("command")
-        args = data.get("args", {})
-        lock = store.locks[device_ieee]
+            command = data.get("command")
+            args = data.get("args", {})
+            lock = store.locks[device_ieee]
 
-        if command == "operation_event_notification":
-            _LOGGER.debug("[IDLock] operation_event args: %s", args)
-            _handle_operation_event(hass, lock, device_ieee, args)
-        elif command == "programming_event_notification":
-            _LOGGER.debug("[IDLock] programming_event args: %s", args)
-            _handle_programming_event(hass, store, lock, device_ieee, args)
+            if command == "operation_event_notification":
+                _LOGGER.debug("[IDLock] operation_event args: %s", args)
+                _handle_operation_event(hass, lock, device_ieee, args)
+            elif command == "programming_event_notification":
+                _LOGGER.debug("[IDLock] programming_event args: %s", args)
+                _handle_programming_event(hass, store, lock, device_ieee, args)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("[IDLock] Error handling zha_event for %s", device_ieee)
 
     unsub = hass.bus.async_listen(EVENT_ZHA, _handle_zha_event)
     hass.data[DOMAIN]["unsub_zha_event"] = unsub
