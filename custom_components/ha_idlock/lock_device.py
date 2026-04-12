@@ -127,11 +127,19 @@ class IDLockDevice:
         _LOGGER.debug("[IDLock] Connected to %s", self.ieee)
         return True
 
-    async def async_read_device_info(self) -> None:
+    async def async_read_device_info(self, timeout: float = 15.0) -> None:
         """Read capabilities and IDLock attributes from the device (sends Zigbee commands)."""
-        await self._read_firmware_versions()
-        await self._read_capabilities()
-        await self._read_idlock_attributes()
+        import asyncio
+
+        try:
+            await asyncio.wait_for(self._read_firmware_versions(), timeout=timeout)
+        except TimeoutError:
+            _LOGGER.warning("[IDLock] Timeout reading firmware for %s (lock may be asleep)", self.ieee)
+        try:
+            await asyncio.wait_for(self._read_capabilities(), timeout=timeout)
+        except TimeoutError:
+            _LOGGER.warning("[IDLock] Timeout reading capabilities for %s (lock may be asleep)", self.ieee)
+        await self._read_idlock_attributes(timeout=timeout)
         _LOGGER.debug(
             "[IDLock] Read device info for %s (fw=%s, module=%s, %d PIN slots, %d RFID slots, PIN %d-%d digits)",
             self.ieee,
@@ -500,12 +508,22 @@ class IDLockDevice:
             _LOGGER.debug("[IDLock] Cleared RFID slot %d", slot)
             return True
 
-    async def async_read_all_slots(self) -> list[dict[str, Any]]:
+    async def async_read_all_slots(self, per_slot_timeout: float = 10.0) -> list[dict[str, Any]]:
         """Read all PIN and RFID slots from the lock hardware."""
+        import asyncio
+
         results: list[dict[str, Any]] = []
         for slot in range(1, self.num_pin_slots + 1):
-            pin_data = await self.async_get_pin(slot)
-            rfid_data = await self.async_get_rfid(slot)
+            try:
+                pin_data = await asyncio.wait_for(self.async_get_pin(slot), timeout=per_slot_timeout)
+            except TimeoutError:
+                _LOGGER.warning("[IDLock] Timeout reading PIN slot %d on %s — aborting scan", slot, self.ieee)
+                break
+            try:
+                rfid_data = await asyncio.wait_for(self.async_get_rfid(slot), timeout=per_slot_timeout)
+            except TimeoutError:
+                _LOGGER.warning("[IDLock] Timeout reading RFID slot %d on %s — aborting scan", slot, self.ieee)
+                break
 
             has_pin = pin_data["in_use"] if pin_data else False
             pin_enabled = pin_data["enabled"] if pin_data else False

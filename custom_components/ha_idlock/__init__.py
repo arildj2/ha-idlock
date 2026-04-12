@@ -133,31 +133,55 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await store.async_save()
 
     # All device work runs in background — never block startup
+    # Each lock runs independently so a dead lock doesn't block others.
+    async def _setup_single_lock(ieee: str, lock: Lock) -> None:
+        """Connect to one device and do initial reads."""
+        device = get_device(hass, ieee)
+        try:
+            await device.async_connect()
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning("[IDLock] Could not connect to %s", ieee)
+            return
+
+        # Read device capabilities (sends Zigbee commands, may be slow)
+        if device.connected:
+            await device.async_read_device_info()
+
+        # First setup: read all slots from lock
+        if not lock.slots and device.connected:
+            _LOGGER.info("[IDLock] First setup for %s — reading slots", lock.name)
+            all_slots = await device.async_read_all_slots()
+            for slot_data in all_slots:
+                s = store.ensure_slot(lock, slot_data["slot"])
+                s.has_code = slot_data["has_pin"]
+                s.has_rfid = slot_data["has_rfid"]
+                s.enabled = slot_data["pin_enabled"] or slot_data["rfid_enabled"]
+            await store.async_save()
+            _LOGGER.info("[IDLock] Initial read complete for %s", lock.name)
+
     async def _background_setup() -> None:
-        """Connect to devices and do initial reads (runs after HA is ready)."""
+        """Connect to all devices concurrently with per-lock timeout."""
+        import asyncio
+
+        PER_LOCK_TIMEOUT = 60  # seconds — fail fast for dead locks
+
+        tasks = []
         for ieee, lock in store.locks.items():
-            device = get_device(hass, ieee)
+            coro = asyncio.wait_for(
+                _setup_single_lock(ieee, lock),
+                timeout=PER_LOCK_TIMEOUT,
+            )
+            tasks.append((ieee, coro))
+
+        for ieee, task in tasks:
             try:
-                await device.async_connect()
+                await task
+            except TimeoutError:
+                _LOGGER.warning(
+                    "[IDLock] Setup timed out for %s (lock may be out of batteries)", ieee
+                )
             except Exception:  # noqa: BLE001
-                _LOGGER.warning("[IDLock] Could not connect to %s", ieee)
-                continue
-
-            # Read device capabilities (sends Zigbee commands, may be slow)
-            if device.connected:
-                await device.async_read_device_info()
-
-            # First setup: read all slots from lock
-            if not lock.slots and device.connected:
-                _LOGGER.info("[IDLock] First setup for %s — reading slots", lock.name)
-                all_slots = await device.async_read_all_slots()
-                for slot_data in all_slots:
-                    s = store.ensure_slot(lock, slot_data["slot"])
-                    s.has_code = slot_data["has_pin"]
-                    s.has_rfid = slot_data["has_rfid"]
-                    s.enabled = slot_data["pin_enabled"] or slot_data["rfid_enabled"]
-                await store.async_save()
-                _LOGGER.info("[IDLock] Initial read complete for %s", lock.name)
+                _LOGGER.warning("[IDLock] Setup failed for %s", ieee, exc_info=True)
 
     hass.async_create_task(_background_setup())
 
