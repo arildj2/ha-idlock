@@ -293,8 +293,9 @@ def _handle_programming_event(
             )
         elif event_code == PROG_EVENT_PIN_DELETED:
             s.has_code = False
-            s.enabled = False
-            s.label = ""
+            if not s.has_rfid:
+                s.enabled = False
+                s.label = ""
             _LOGGER.info(
                 "[IDLock] %s: PIN deleted from slot %d (via %s)",
                 lock.name,
