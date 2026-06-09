@@ -1,9 +1,6 @@
-import {
-  LitElement,
-  html,
-  css,
-} from "https://unpkg.com/lit-element@4.1.1/lit-element.js?module";
-import { live } from "https://unpkg.com/lit@3.2.1/directives/live.js?module";
+// Lit is vendored locally (frontend/lit-all.min.js, official lit/dist@3 bundle)
+// so the panel works without internet access and avoids CDN supply-chain risk.
+import { LitElement, html, css, live } from "./lit-all.min.js";
 
 class HaIdlockPanel extends LitElement {
   static get properties() {
