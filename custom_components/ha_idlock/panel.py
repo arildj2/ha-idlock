@@ -32,36 +32,25 @@ async def async_register_panel(hass: HomeAssistant) -> None:
         )
         domain_data["static_paths_registered"] = True
 
+    panel_kwargs = {
+        "component_name": "custom",
+        "frontend_url_path": PANEL_URL_PATH,
+        "sidebar_title": PANEL_TITLE,
+        "sidebar_icon": PANEL_ICON,
+        "require_admin": True,
+        "config": {
+            "_panel_custom": {
+                "name": "ha-idlock-panel",
+                "module_url": PANEL_MODULE_URL,
+            },
+        },
+    }
+
     try:
-        async_register_built_in_panel(
-            hass,
-            component_name="custom",
-            frontend_url_path=PANEL_URL_PATH,
-            sidebar_title=PANEL_TITLE,
-            sidebar_icon=PANEL_ICON,
-            require_admin=True,
-            config={
-                "_panel_custom": {
-                    "name": "ha-idlock-panel",
-                    "module_url": PANEL_MODULE_URL,
-                },
-            },
-        )
+        async_register_built_in_panel(hass, **panel_kwargs)
     except ValueError:
+        # Panel already registered (e.g. config entry reload) — replace it
         async_remove_panel(hass, PANEL_URL_PATH)
-        async_register_built_in_panel(
-            hass,
-            component_name="custom",
-            frontend_url_path=PANEL_URL_PATH,
-            sidebar_title=PANEL_TITLE,
-            sidebar_icon=PANEL_ICON,
-            require_admin=True,
-            config={
-                "_panel_custom": {
-                    "name": "ha-idlock-panel",
-                    "module_url": PANEL_MODULE_URL,
-                },
-            },
-        )
+        async_register_built_in_panel(hass, **panel_kwargs)
 
     domain_data["panel_registered"] = True

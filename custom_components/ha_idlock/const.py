@@ -37,7 +37,7 @@ ATTR_HINGE_MODE = 0x4002  # BOOLEAN: not used
 ATTR_SERVICE_PIN_MODE = 0x4003  # UINT8: 0=off, 1-4=limited uses, 5-6=random, 7=always, 8=12h, 9=24h
 ATTR_LOCK_MODE = 0x4004  # UINT8: 0-3 auto-lock/away-mode combinations
 ATTR_RELOCK_ENABLED = 0x4005  # BOOLEAN: true/false
-ATTR_AUDIO_VOLUME = 0x4006  # UINT8: 0=silent, 1-5=volume levels
+ATTR_AUDIO_VOLUME = 0x4006  # UINT8: 0=silent, 1-5=volume levels (read fallback only — UI uses standard sound_volume 0x0024, 0-2)
 
 # Service PIN mode values
 SERVICE_PIN_DEACTIVATED = 0

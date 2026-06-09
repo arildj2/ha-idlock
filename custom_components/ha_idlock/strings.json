@@ -7,6 +7,9 @@
           "locks": "ZHA lock entities"
         }
       }
+    },
+    "abort": {
+      "already_configured": "Already configured. Only a single instance is supported — use Configure to add or remove locks."
     }
   },
   "options": {

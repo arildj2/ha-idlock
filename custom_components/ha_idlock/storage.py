@@ -10,6 +10,9 @@ from homeassistant.helpers.storage import Store
 
 from .const import STORAGE_KEY, STORAGE_VERSION
 
+# Delay (seconds) for coalescing event-driven saves into one disk write
+SAVE_DELAY = 10
+
 
 @dataclass
 class Slot:
@@ -30,6 +33,7 @@ class Lock:
     entity_id: str
     device_ieee: str
     max_slots: int = 25
+    custom_name: bool = False  # True if the user renamed the lock via the panel
     slots: dict[int, Slot] = field(default_factory=dict)
 
 
@@ -51,6 +55,8 @@ class IDLockStore:
 
         self.locks = {}
         for ieee, raw in data.get("locks", {}).items():
+            if not isinstance(raw, dict) or not raw.get("entity_id"):
+                continue  # skip malformed entries rather than failing setup
             slots: dict[int, Slot] = {}
             for k, v in raw.get("slots", {}).items():
                 slots[int(k)] = Slot(
@@ -61,21 +67,23 @@ class IDLockStore:
                     has_rfid=v.get("has_rfid", False),
                 )
             self.locks[ieee] = Lock(
-                name=raw["name"],
+                name=raw.get("name") or raw["entity_id"],
                 entity_id=raw["entity_id"],
                 device_ieee=ieee,
                 max_slots=raw.get("max_slots", 25),
+                custom_name=raw.get("custom_name", False),
                 slots=slots,
             )
 
-    async def async_save(self) -> None:
-        """Persist all lock data."""
-        data: dict[str, Any] = {
+    def _data_to_save(self) -> dict[str, Any]:
+        """Serialize all lock data for storage."""
+        return {
             "locks": {
                 ieee: {
                     "name": lock.name,
                     "entity_id": lock.entity_id,
                     "max_slots": lock.max_slots,
+                    "custom_name": lock.custom_name,
                     "slots": {
                         str(s.slot): {
                             "label": s.label,
@@ -89,7 +97,14 @@ class IDLockStore:
                 for ieee, lock in self.locks.items()
             },
         }
-        await self._store.async_save(data)
+
+    async def async_save(self) -> None:
+        """Persist all lock data immediately."""
+        await self._store.async_save(self._data_to_save())
+
+    def async_schedule_save(self) -> None:
+        """Persist lock data after a delay, coalescing rapid changes."""
+        self._store.async_delay_save(self._data_to_save, SAVE_DELAY)
 
     def get_lock(self, ieee: str) -> Lock | None:
         """Get a lock by IEEE address."""

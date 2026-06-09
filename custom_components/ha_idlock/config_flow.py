@@ -60,6 +60,11 @@ class IDLockConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
         """Select ZHA lock entities."""
+        # The integration uses global state (store, panel, event listener),
+        # so only a single config entry is supported.
+        await self.async_set_unique_id(DOMAIN)
+        self._abort_if_unique_id_configured()
+
         if user_input is not None:
             selected: list[str] = user_input.get(CONF_LOCKS, [])
             locks: list[dict[str, Any]] = []

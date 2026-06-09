@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -11,7 +12,16 @@ from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    ATTR_AUDIO_VOLUME,
+    ATTR_LOCK_FW_VERSION,
+    ATTR_LOCK_MODE,
+    ATTR_MASTER_PIN_MODE,
+    ATTR_RELOCK_ENABLED,
+    ATTR_RFID_ENABLED,
+    ATTR_SERVICE_PIN_MODE,
+    BASIC_CLUSTER_ID,
     DOMAIN,
+    IDLOCK_MANUFACTURER_CODE,
     WS_CLEAR_CODE,
     WS_DISABLE_CODE,
     WS_ENABLE_CODE,
@@ -38,6 +48,19 @@ PIN_CODE_SCHEMA = vol.All(str, vol.Match(r"^\d{4,10}$"))
 def _get_store(hass: HomeAssistant) -> IDLockStore | None:
     """Get the store, or None if not loaded."""
     return hass.data.get(DOMAIN, {}).get("store")
+
+
+def _validate_slot(
+    connection: websocket_api.ActiveConnection, msg: dict[str, Any], lock: Any
+) -> int | None:
+    """Validate the slot number against the lock's max_slots. Sends error on failure."""
+    slot = int(msg["slot"])
+    if slot > lock.max_slots:
+        connection.send_error(
+            msg["id"], "invalid_slot", f"Slot must be 1-{lock.max_slots}"
+        )
+        return None
+    return slot
 
 
 async def _get_lock_and_device(
@@ -97,6 +120,7 @@ def _lock_to_dict(lock: Any) -> dict[str, Any]:
 # --- List / Get ---
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command({vol.Required("type"): WS_LIST_LOCKS})
 @websocket_api.async_response
 async def ws_list_locks(
@@ -110,6 +134,7 @@ async def ws_list_locks(
     connection.send_result(msg["id"], [_lock_to_dict(lock) for lock in store.locks.values()])
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {vol.Required("type"): WS_GET_LOCK, vol.Required("device_ieee"): str}
 )
@@ -128,6 +153,7 @@ async def ws_get_lock(
 # --- PIN operations (require device) ---
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {
         vol.Required("type"): WS_SET_CODE,
@@ -147,7 +173,9 @@ async def ws_set_code(
         return
     store, lock, device = result
 
-    slot = int(msg["slot"])
+    slot = _validate_slot(connection, msg, lock)
+    if slot is None:
+        return
     success = await device.async_set_pin(slot, msg["code"])
     if not success:
         connection.send_error(msg["id"], "device_error", f"Failed to set code on slot {slot}")
@@ -161,6 +189,7 @@ async def ws_set_code(
     connection.send_result(msg["id"], _lock_to_dict(lock))
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {vol.Required("type"): WS_CLEAR_CODE, vol.Required("device_ieee"): str, vol.Required("slot"): SLOT_SCHEMA}
 )
@@ -174,7 +203,9 @@ async def ws_clear_code(
         return
     store, lock, device = result
 
-    slot = int(msg["slot"])
+    slot = _validate_slot(connection, msg, lock)
+    if slot is None:
+        return
     success = await device.async_clear_pin(slot)
     if not success:
         connection.send_error(msg["id"], "device_error", f"Failed to clear slot {slot}")
@@ -189,6 +220,7 @@ async def ws_clear_code(
     connection.send_result(msg["id"], _lock_to_dict(lock))
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {vol.Required("type"): WS_ENABLE_CODE, vol.Required("device_ieee"): str, vol.Required("slot"): SLOT_SCHEMA}
 )
@@ -202,7 +234,9 @@ async def ws_enable_code(
         return
     store, lock, device = result
 
-    slot = int(msg["slot"])
+    slot = _validate_slot(connection, msg, lock)
+    if slot is None:
+        return
     success = await device.async_enable_pin(slot)
     if not success:
         connection.send_error(msg["id"], "device_error", f"Failed to enable slot {slot}")
@@ -214,6 +248,7 @@ async def ws_enable_code(
     connection.send_result(msg["id"], _lock_to_dict(lock))
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {vol.Required("type"): WS_DISABLE_CODE, vol.Required("device_ieee"): str, vol.Required("slot"): SLOT_SCHEMA}
 )
@@ -227,7 +262,9 @@ async def ws_disable_code(
         return
     store, lock, device = result
 
-    slot = int(msg["slot"])
+    slot = _validate_slot(connection, msg, lock)
+    if slot is None:
+        return
     success = await device.async_disable_pin(slot)
     if not success:
         connection.send_error(msg["id"], "device_error", f"Failed to disable slot {slot}")
@@ -242,6 +279,7 @@ async def ws_disable_code(
 # --- RFID ---
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {vol.Required("type"): "idlock/clear_rfid", vol.Required("device_ieee"): str, vol.Required("slot"): SLOT_SCHEMA}
 )
@@ -255,7 +293,9 @@ async def ws_clear_rfid(
         return
     store, lock, device = result
 
-    slot = int(msg["slot"])
+    slot = _validate_slot(connection, msg, lock)
+    if slot is None:
+        return
     success = await device.async_clear_rfid(slot)
     if not success:
         connection.send_error(msg["id"], "device_error", f"Failed to clear RFID slot {slot}")
@@ -273,6 +313,7 @@ async def ws_clear_rfid(
 # --- Metadata (store-only, no device needed) ---
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {
         vol.Required("type"): WS_RENAME_CODE,
@@ -291,18 +332,22 @@ async def ws_rename_code(
         return
     store, lock, _ = result
 
-    s = store.ensure_slot(lock, int(msg["slot"]))
+    slot = _validate_slot(connection, msg, lock)
+    if slot is None:
+        return
+    s = store.ensure_slot(lock, slot)
     s.label = msg["label"]
     await store.async_save()
     connection.send_result(msg["id"], _lock_to_dict(lock))
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {
         vol.Required("type"): WS_SAVE_LOCK_META,
         vol.Required("device_ieee"): str,
-        vol.Optional("name"): str,
-        vol.Optional("max_slots"): int,
+        vol.Optional("name"): vol.All(str, vol.Length(min=1, max=64)),
+        vol.Optional("max_slots"): vol.All(int, vol.Range(min=1, max=255)),
     }
 )
 @websocket_api.async_response
@@ -317,6 +362,9 @@ async def ws_save_lock_meta(
 
     if "name" in msg:
         lock.name = msg["name"]
+        # User explicitly renamed via the panel — don't overwrite from the
+        # device registry on the next reload (see async_setup_entry).
+        lock.custom_name = True
     if "max_slots" in msg:
         lock.max_slots = int(msg["max_slots"])
 
@@ -327,6 +375,7 @@ async def ws_save_lock_meta(
 # --- Full sync (require device) ---
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {vol.Required("type"): WS_READ_ALL_CODES, vol.Required("device_ieee"): str}
 )
@@ -376,6 +425,7 @@ async def ws_read_all_codes(
 # --- Device settings (require device) ---
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {vol.Required("type"): "idlock/get_device_settings", vol.Required("device_ieee"): str}
 )
@@ -395,6 +445,7 @@ async def ws_get_device_settings(
     connection.send_result(msg["id"], device.get_device_info())
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "idlock/set_device_setting",
@@ -440,6 +491,7 @@ async def ws_set_device_setting(
 # --- Read single PIN (require device) ---
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {vol.Required("type"): WS_READ_PIN, vol.Required("device_ieee"): str, vol.Required("slot"): SLOT_SCHEMA}
 )
@@ -451,9 +503,11 @@ async def ws_read_pin(
     result = await _get_lock_and_device(hass, connection, msg, require_device=True)
     if not result:
         return
-    _, _, device = result
+    _, lock, device = result
 
-    slot = int(msg["slot"])
+    slot = _validate_slot(connection, msg, lock)
+    if slot is None:
+        return
     pin_data = await device.async_get_pin(slot)
     if pin_data is None:
         connection.send_error(msg["id"], "device_error", f"Failed to read slot {slot}")
@@ -468,6 +522,7 @@ async def ws_read_pin(
 # --- Debug ---
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "idlock/debug_read_slot",
@@ -489,6 +544,7 @@ async def ws_debug_read_slot(
     connection.send_result(msg["id"], raw)
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {vol.Required("type"): "idlock/debug_read_mfr_attrs", vol.Required("device_ieee"): str}
 )
@@ -497,24 +553,10 @@ async def ws_debug_read_mfr_attrs(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
 ) -> None:
     """Debug: try multiple strategies to read manufacturer-specific attributes."""
-    import asyncio
-
     result = await _get_lock_and_device(hass, connection, msg, require_device=True)
     if not result:
         return
     _, _, device = result
-
-    from .const import (
-        ATTR_AUDIO_VOLUME,
-        ATTR_LOCK_FW_VERSION,
-        ATTR_LOCK_MODE,
-        ATTR_MASTER_PIN_MODE,
-        ATTR_RELOCK_ENABLED,
-        ATTR_RFID_ENABLED,
-        ATTR_SERVICE_PIN_MODE,
-        BASIC_CLUSTER_ID,
-        IDLOCK_MANUFACTURER_CODE,
-    )
 
     cluster = device._cluster  # noqa: SLF001
     zigpy_dev = device._zigpy_device  # noqa: SLF001

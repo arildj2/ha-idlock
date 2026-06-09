@@ -74,6 +74,16 @@ _PROG_EVENT_MAP = {
     PROG_EVENT_RFID_DELETED: "rfid_deleted",
 }
 
+# New ZHA may send string event names (e.g. "PinAdded") instead of int codes
+_PROG_EVENT_STR_MAP = {
+    "mastercodechanged": (PROG_EVENT_MASTER_CODE_CHANGED, "master_code_changed"),
+    "pinadded": (PROG_EVENT_PIN_ADDED, "pin_added"),
+    "pindeleted": (PROG_EVENT_PIN_DELETED, "pin_deleted"),
+    "pinchanged": (PROG_EVENT_PIN_CHANGED, "pin_changed"),
+    "rfidadded": (PROG_EVENT_RFID_ADDED, "rfid_added"),
+    "rfiddeleted": (PROG_EVENT_RFID_DELETED, "rfid_deleted"),
+}
+
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Set up the integration (config entry only)."""
@@ -115,8 +125,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 device_ieee=device_ieee,
                 max_slots=max_slots,
             )
-        else:
-            # Update name on every load to pick up renames
+        elif not store.locks[device_ieee].custom_name:
+            # Update name on every load to pick up device registry renames,
+            # unless the user explicitly renamed the lock via the panel
             store.locks[device_ieee].name = friendly_name
 
     # Prune deselected locks
@@ -181,7 +192,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Pre-import platform modules in the executor so async_forward_entry_setups
     # doesn't trigger a blocking import_module call inside the event loop.
     await hass.async_add_import_executor_job(
-        importlib.import_module, "custom_components.ha_idlock.sensor"
+        importlib.import_module, f"{__package__}.sensor"
     )
 
     # Forward to entity platforms
@@ -244,21 +255,14 @@ def _handle_programming_event(
     # Older ZHA uses integer keys: program_event_source, program_event_code, user_id
     if "source" in args:
         source = str(args["source"]).lower()
-        event_code_raw = args.get("event") or args.get("program_event_code")
+        event_code_raw = args.get("event")
+        if event_code_raw is None:
+            event_code_raw = args.get("program_event_code")
         user_id = args.get("code_slot") if args.get("code_slot") is not None else args.get("user_id")
     else:
         source = _parse_value(args.get("program_event_source"), _SOURCE_MAP)
         event_code_raw = args.get("program_event_code")
         user_id = args.get("user_id")
-    # New ZHA may send string event names (e.g. "PinAdded") instead of int codes
-    _PROG_EVENT_STR_MAP = {
-        "mastercodechanged": (PROG_EVENT_MASTER_CODE_CHANGED, "master_code_changed"),
-        "pinadded": (PROG_EVENT_PIN_ADDED, "pin_added"),
-        "pindeleted": (PROG_EVENT_PIN_DELETED, "pin_deleted"),
-        "pinchanged": (PROG_EVENT_PIN_CHANGED, "pin_changed"),
-        "rfidadded": (PROG_EVENT_RFID_ADDED, "rfid_added"),
-        "rfiddeleted": (PROG_EVENT_RFID_DELETED, "rfid_deleted"),
-    }
     if isinstance(event_code_raw, str) and not event_code_raw.isdigit():
         matched = _PROG_EVENT_STR_MAP.get(event_code_raw.lower().replace("_", ""), (0, event_code_raw.lower()))
         event_code = matched[0]
@@ -322,8 +326,8 @@ def _handle_programming_event(
                 source,
             )
 
-        # Persist the change
-        hass.async_create_task(store.async_save())
+        # Persist the change (delayed, coalesces keypad programming bursts)
+        store.async_schedule_save()
 
     # Fire event for automations
     hass.bus.async_fire(
@@ -349,8 +353,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unsub := hass.data.get(DOMAIN, {}).pop("unsub_zha_event", None):
         unsub()
 
-    # Clear cached device connections so reload gets fresh ones
+    # Clear cached device connections so reload gets fresh ones, and drop
+    # the store so the (still registered) WS handlers don't serve stale data
     hass.data.get(DOMAIN, {}).pop("devices", None)
+    hass.data.get(DOMAIN, {}).pop("store", None)
+    hass.data.get(DOMAIN, {}).pop("entry", None)
 
     return unload_ok
 

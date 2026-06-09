@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from typing import Any
 
-from zigpy.types import EUI64, Bool as zigpy_Bool, uint8_t as zigpy_uint8, uint16_t as zigpy_uint16
-from zigpy.zcl.foundation import Attribute, TypeValue, ZCLAttributeDef
+from zigpy.types import EUI64, uint8_t as zigpy_uint8, uint16_t as zigpy_uint16
+from zigpy.zcl.foundation import Attribute, TypeValue
 
 from homeassistant.core import HomeAssistant
 
@@ -31,24 +32,6 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
-
-# IDLock manufacturer-specific attribute definitions for zigpy.
-# These must be registered on the DoorLock cluster so zigpy can parse
-# read_attributes responses (otherwise KeyError on 0x4000+ IDs).
-_IDLOCK_MFR_ATTR_DEFS: dict[int, ZCLAttributeDef] = {}
-try:
-    _IDLOCK_MFR_ATTR_DEFS = {
-        0x4000: ZCLAttributeDef(name="idlock_master_pin_mode", type=zigpy_Bool, is_manufacturer_specific=True),
-        0x4001: ZCLAttributeDef(name="idlock_rfid_enabled", type=zigpy_Bool, is_manufacturer_specific=True),
-        0x4002: ZCLAttributeDef(name="idlock_hinge_mode", type=zigpy_Bool, is_manufacturer_specific=True),
-        0x4003: ZCLAttributeDef(name="idlock_service_pin_mode", type=zigpy_uint8, is_manufacturer_specific=True),
-        0x4004: ZCLAttributeDef(name="idlock_lock_mode", type=zigpy_uint8, is_manufacturer_specific=True),
-        0x4005: ZCLAttributeDef(name="idlock_relock_enabled", type=zigpy_Bool, is_manufacturer_specific=True),
-        0x4006: ZCLAttributeDef(name="idlock_audio_volume", type=zigpy_uint8, is_manufacturer_specific=True),
-    }
-except TypeError:
-    # Older zigpy versions may have different ZCLAttributeDef constructor
-    _LOGGER.debug("[IDLock] Could not create ZCLAttributeDef objects — will use fallback reads")
 
 
 class IDLockDevice:
@@ -138,8 +121,6 @@ class IDLockDevice:
         if self._reading_info:
             return
         self._reading_info = True
-        import asyncio
-
         try:
             try:
                 await asyncio.wait_for(self._read_firmware_versions(), timeout=timeout)
@@ -203,7 +184,7 @@ class IDLockDevice:
                 status = getattr(record, "status", None)
                 value_obj = getattr(record, "value", None)
                 val = getattr(value_obj, "value", None) if value_obj else None
-                if aid == ATTR_LOCK_FW_VERSION and status is not None and status == 0 and val is not None:
+                if aid == ATTR_LOCK_FW_VERSION and status == 0 and val is not None:
                     self.lock_firmware = str(val)
         except Exception:  # noqa: BLE001
             _LOGGER.debug("[IDLock] Could not read lock firmware version for %s", self.ieee)
@@ -255,8 +236,6 @@ class IDLockDevice:
         Uses an explicit timeout to fail fast on sleepy locks that don't
         respond to attribute reads (the lock may only respond to commands).
         """
-        import asyncio
-
         # Read standard sound_volume first (known to work from diagnostic)
         try:
             result = await asyncio.wait_for(
@@ -296,7 +275,7 @@ class IDLockDevice:
                 status = getattr(record, "status", None)
                 value_obj = getattr(record, "value", None)
                 val = getattr(value_obj, "value", None) if value_obj else None
-                if aid is not None and status is not None and status == 0 and val is not None:
+                if aid is not None and status == 0 and val is not None:
                     attrs[aid] = val
 
             _LOGGER.debug("[IDLock] %s: raw mfr attrs=%s", self.ieee, attrs)
@@ -311,8 +290,10 @@ class IDLockDevice:
                 self.lock_mode = int(attrs[ATTR_LOCK_MODE])
             if ATTR_RELOCK_ENABLED in attrs:
                 self.relock_enabled = bool(attrs[ATTR_RELOCK_ENABLED])
-            # Manufacturer audio_volume (0x4006) overrides standard if available
-            if ATTR_AUDIO_VOLUME in attrs:
+            # Manufacturer audio_volume (0x4006, 0-5 scale) is only a fallback:
+            # the UI reads and writes the standard sound_volume (0x0024, 0-2),
+            # so the standard value must win when both are available.
+            if ATTR_AUDIO_VOLUME in attrs and self.audio_volume is None:
                 self.audio_volume = int(attrs[ATTR_AUDIO_VOLUME])
 
             self.mfr_attrs_supported = bool(attrs)
@@ -523,8 +504,6 @@ class IDLockDevice:
 
     async def async_read_all_slots(self, per_slot_timeout: float = 10.0) -> list[dict[str, Any]]:
         """Read all PIN and RFID slots from the lock hardware."""
-        import asyncio
-
         results: list[dict[str, Any]] = []
         for slot in range(1, self.num_pin_slots + 1):
             try:
@@ -538,24 +517,24 @@ class IDLockDevice:
                 _LOGGER.warning("[IDLock] Timeout reading RFID slot %d on %s — aborting scan", slot, self.ieee)
                 break
 
-            has_pin = pin_data["in_use"] if pin_data else False
-            pin_enabled = pin_data["enabled"] if pin_data else False
-            has_rfid = rfid_data["in_use"] if rfid_data else False
-            rfid_enabled = rfid_data["enabled"] if rfid_data else False
+            # A None response means the read failed (e.g. delivery error) —
+            # abort rather than record the slot as empty, so the partial-scan
+            # guard in ws_read_all_codes keeps the store untouched.
+            if pin_data is None or rfid_data is None:
+                _LOGGER.warning("[IDLock] Failed reading slot %d on %s — aborting scan", slot, self.ieee)
+                break
 
             results.append({
                 "slot": slot,
-                "has_pin": has_pin,
-                "pin_enabled": pin_enabled,
-                "has_rfid": has_rfid,
-                "rfid_enabled": rfid_enabled,
+                "has_pin": pin_data["in_use"],
+                "pin_enabled": pin_data["enabled"],
+                "has_rfid": rfid_data["in_use"],
+                "rfid_enabled": rfid_data["enabled"],
             })
         return results
 
     async def async_read_all_pins(self, per_slot_timeout: float = 10.0) -> list[dict[str, Any]]:
         """Read all PIN slots from the lock hardware (legacy, PIN-only)."""
-        import asyncio
-
         results: list[dict[str, Any]] = []
         for slot in range(1, self.num_pin_slots + 1):
             try:
@@ -587,8 +566,6 @@ class IDLockDevice:
             attrid=zigpy_uint16(attr_id),
             value=TypeValue(type=zcl_type, value=zigpy_uint8(int(value))),
         )
-
-        import asyncio
 
         try:
             # Use _write_attributes directly (same approach as zha-toolkit)
@@ -641,8 +618,6 @@ class IDLockDevice:
 
     async def async_set_require_pin_for_rf(self, enabled: bool) -> bool:
         """Enable or disable requiring PIN for RF operations."""
-        import asyncio
-
         if not self._cluster:
             return False
         try:
@@ -659,8 +634,6 @@ class IDLockDevice:
 
     async def async_set_audio_volume(self, volume: int) -> bool:
         """Set audio volume (0=silent, 1=low, 2=high)."""
-        import asyncio
-
         if not self._cluster:
             return False
         try:
@@ -695,22 +668,6 @@ class IDLockDevice:
             self.service_pin_mode = mode
             return True
         return False
-
-
-def _register_mfr_attributes(cluster: Any) -> None:
-    """Register IDLock manufacturer attributes on a DoorLock cluster.
-
-    This lets zigpy parse read_attributes responses for 0x4000+ attribute IDs
-    that aren't in the standard ZCL DoorLock definition.
-    """
-    if not _IDLOCK_MFR_ATTR_DEFS:
-        return
-    for attr_id, attr_def in _IDLOCK_MFR_ATTR_DEFS.items():
-        if attr_id not in cluster.attributes:
-            try:
-                cluster.attributes[attr_id] = attr_def
-            except Exception:  # noqa: BLE001
-                pass
 
 
 def _get_zha_gateway(hass: HomeAssistant) -> Any:
