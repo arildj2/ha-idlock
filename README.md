@@ -282,25 +282,6 @@ Events received from the lock:
 | Lock/unlock activity | `operation_event_notification` | 0x20 |
 | Code add/delete/change | `programming_event_notification` | 0x21 |
 
-### Comparison with Other Integrations
-
-| Feature | ha_idlock | zha_lock_manager | keymaster |
-|---------|-----------|------------------|-----------|
-| Target platform | ZHA (Zigbee) | ZHA (Zigbee) | Z-Wave JS |
-| PIN read-back from lock | Yes | No | Yes (cached) |
-| RFID tracking | Yes | No | No |
-| Code change detection | Yes (push events) | No | Yes (polling) |
-| Background polling | None needed | None | Every 60s (free on Z-Wave) |
-| Battery impact | Minimal | Minimal | N/A (Z-Wave) |
-| Lock settings UI | Yes (7 settings) | No | No |
-| Manufacturer attributes | Yes (0x4000–0x4006) | No | No |
-| Side panel UI | Yes (inline editing) | Yes (prompt dialogs) | No (Lovelace) |
-| Per-row save | Yes | No (immediate) | No |
-| Progress indicators | Yes | No | No |
-| Automation events | Yes (2 event types) | No | Yes |
-| Non-blocking startup | Yes | Yes | No |
-| HACS installable | Yes | Yes | Yes |
-
 ## License
 
 MIT
