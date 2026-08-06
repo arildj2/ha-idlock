@@ -106,12 +106,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     for item in cfg_locks:
         entity_id = item.get("entity_id")
-        device_ieee = item.get("device_ieee")
+        raw_device_ieee = item.get("device_ieee")
         name = item.get("name")
         max_slots = int(item.get("max_slots", 25))
 
-        if not (entity_id and device_ieee and name):
+        if not (entity_id and raw_device_ieee and name):
             continue
+        device_ieee = str(raw_device_ieee)
 
         selected_ieees.add(device_ieee)
 
@@ -125,10 +126,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 device_ieee=device_ieee,
                 max_slots=max_slots,
             )
-        elif not store.locks[device_ieee].custom_name:
-            # Update name on every load to pick up device registry renames,
-            # unless the user explicitly renamed the lock via the panel
-            store.locks[device_ieee].name = friendly_name
+        else:
+            stored_lock = store.locks[device_ieee]
+            # Entity IDs can change after an entity-registry rename.
+            stored_lock.entity_id = entity_id
+            if not stored_lock.custom_name:
+                # Pick up device-registry renames unless the user explicitly
+                # renamed the lock via the panel.
+                stored_lock.name = friendly_name
 
     # Prune deselected locks
     to_delete = [ieee for ieee in list(store.locks) if ieee not in selected_ieees]
@@ -159,8 +164,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     @callback
     def _handle_zha_event(event: Any) -> None:
         data = event.data or {}
-        device_ieee = data.get("device_ieee")
-        if not device_ieee or device_ieee not in store.locks:
+        raw_device_ieee = data.get("device_ieee")
+        if not raw_device_ieee:
+            return
+        device_ieee = str(raw_device_ieee)
+        if device_ieee not in store.locks:
             return
 
         # Only process DoorLock cluster events
@@ -175,6 +183,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             command = data.get("command")
             args = data.get("args", {})
+            if not isinstance(args, dict):
+                _LOGGER.warning(
+                    "[IDLock] Ignoring malformed %s args for %s: %r",
+                    command,
+                    device_ieee,
+                    args,
+                )
+                return
             lock = store.locks[device_ieee]
 
             if command == "operation_event_notification":
@@ -283,7 +299,7 @@ def _handle_programming_event(
             slot = 0
 
     # Update our local store based on the event
-    if slot > 0:
+    if 0 < slot <= lock.max_slots:
         s = store.ensure_slot(lock, slot)
         if event_code in (PROG_EVENT_PIN_ADDED, PROG_EVENT_PIN_CHANGED):
             s.has_code = True
@@ -346,9 +362,11 @@ def _handle_programming_event(
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not unload_ok:
+        return False
 
     with contextlib.suppress(Exception):
-        remove_panel(hass, PANEL_URL_PATH)
+        remove_panel(hass, PANEL_URL_PATH, warn_if_unknown=False)
 
     if unsub := hass.data.get(DOMAIN, {}).pop("unsub_zha_event", None):
         unsub()
@@ -365,15 +383,23 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Handle removal: wipe stored data."""
     with contextlib.suppress(Exception):
-        remove_panel(hass, PANEL_URL_PATH)
+        remove_panel(hass, PANEL_URL_PATH, warn_if_unknown=False)
 
-    store: IDLockStore | None = hass.data.get(DOMAIN, {}).get("store")
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    if unsub := domain_data.pop("unsub_zha_event", None):
+        unsub()
+
+    store: IDLockStore | None = domain_data.get("store")
     if store is None:
         store = IDLockStore(hass)
         await store.async_load()
     await store.async_wipe()
 
-    hass.data.pop(DOMAIN, None)
+    # WebSocket commands and HTTP static routes cannot be unregistered. Preserve
+    # their registration flags so removing and re-adding the integration in the
+    # same HA process does not try to register duplicate handlers/routes.
+    for key in ("devices", "store", "entry", "panel_registered"):
+        domain_data.pop(key, None)
 
 
 def _parse_value(value: Any, mapping: dict[int, str]) -> str:

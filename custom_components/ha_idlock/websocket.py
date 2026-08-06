@@ -44,6 +44,18 @@ SLOT_SCHEMA = vol.All(int, vol.Range(min=1))
 # PIN code must be 4-10 digits
 PIN_CODE_SCHEMA = vol.All(str, vol.Match(r"^\d{4,10}$"))
 
+_BOOLEAN_SETTINGS = {
+    "master_pin_mode",
+    "relock_enabled",
+    "require_pin_for_rf",
+    "rfid_enabled",
+}
+_INTEGER_SETTING_RANGES = {
+    "audio_volume": (0, 2),
+    "lock_mode": (0, 3),
+    "service_pin_mode": (0, 9),
+}
+
 
 def _get_store(hass: HomeAssistant) -> IDLockStore | None:
     """Get the store, or None if not loaded."""
@@ -61,6 +73,36 @@ def _validate_slot(
         )
         return None
     return slot
+
+
+def _validate_setting_value(
+    connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> bool:
+    """Validate a device-setting value without truthy string coercion."""
+    setting = msg["setting"]
+    value = msg["value"]
+
+    if setting in _BOOLEAN_SETTINGS:
+        valid = type(value) is bool
+        expected = "true or false"
+    elif setting in _INTEGER_SETTING_RANGES:
+        minimum, maximum = _INTEGER_SETTING_RANGES[setting]
+        valid = type(value) is int and minimum <= value <= maximum
+        expected = f"an integer from {minimum} to {maximum}"
+    else:
+        connection.send_error(
+            msg["id"], "invalid_setting", f"Unknown setting: {setting}"
+        )
+        return False
+
+    if not valid:
+        connection.send_error(
+            msg["id"],
+            "invalid_value",
+            f"{setting} must be {expected}",
+        )
+        return False
+    return True
 
 
 async def _get_lock_and_device(
@@ -182,7 +224,7 @@ async def ws_set_code(
         return
 
     s = store.ensure_slot(lock, slot)
-    s.label = msg.get("label", "") or s.label
+    s.label = msg["label"]
     s.enabled = True
     s.has_code = True
     await store.async_save()
@@ -391,29 +433,40 @@ async def ws_read_all_codes(
 
     _LOGGER.info("[IDLock] Reading all %d slots from %s (PIN + RFID)...", device.num_pin_slots, lock.name)
     all_slots = await device.async_read_all_slots()
-    expected = device.num_pin_slots
+    expected = max(device.num_pin_slots, device.num_rfid_slots)
     _LOGGER.info("[IDLock] Read %d/%d slot responses from %s", len(all_slots), expected, lock.name)
 
     # Only update store if we got a complete scan — partial data would
     # overwrite previously known slot states for the missing slots.
     if len(all_slots) < expected:
         _LOGGER.warning("[IDLock] Incomplete scan for %s — store not updated", lock.name)
-    else:
-        found_pins = 0
-        found_rfids = 0
-        for slot_data in all_slots:
-            slot_num = slot_data["slot"]
-            s = store.ensure_slot(lock, slot_num)
-            s.has_code = slot_data["has_pin"]
-            s.has_rfid = slot_data["has_rfid"]
-            s.enabled = slot_data["pin_enabled"] or slot_data["rfid_enabled"]
-            if slot_data["has_pin"]:
-                found_pins += 1
-            if slot_data["has_rfid"]:
-                found_rfids += 1
+        connection.send_error(
+            msg["id"],
+            "incomplete_scan",
+            f"Lock responded for only {len(all_slots)} of {expected} slots; existing data was preserved",
+        )
+        return
 
-        _LOGGER.info("[IDLock] Found %d PINs and %d RFIDs on %s", found_pins, found_rfids, lock.name)
-        await store.async_save()
+    found_pins = 0
+    found_rfids = 0
+    for slot_data in all_slots:
+        slot_num = slot_data["slot"]
+        s = store.ensure_slot(lock, slot_num)
+        s.has_code = slot_data["has_pin"]
+        s.has_rfid = slot_data["has_rfid"]
+        s.enabled = slot_data["pin_enabled"] or slot_data["rfid_enabled"]
+        if slot_data["has_pin"]:
+            found_pins += 1
+        if slot_data["has_rfid"]:
+            found_rfids += 1
+
+    _LOGGER.info(
+        "[IDLock] Found %d PINs and %d RFIDs on %s",
+        found_pins,
+        found_rfids,
+        lock.name,
+    )
+    await store.async_save()
 
     # Lock is confirmed awake after successful slot scan — try reading settings
     # if we haven't loaded them yet (helps sleepy locks that timeout on cold reads)
@@ -464,22 +517,21 @@ async def ws_set_device_setting(
         return
     _, _, device = result
 
-    setting = msg["setting"]
-    setting_handlers = {
-        "master_pin_mode": lambda v: device.async_set_master_pin_mode(bool(v)),
-        "rfid_enabled": lambda v: device.async_set_rfid_enabled(bool(v)),
-        "require_pin_for_rf": lambda v: device.async_set_require_pin_for_rf(bool(v)),
-        "service_pin_mode": lambda v: device.async_set_service_pin_mode(int(v)),
-        "lock_mode": lambda v: device.async_set_lock_mode(int(v)),
-        "relock_enabled": lambda v: device.async_set_relock(bool(v)),
-        "audio_volume": lambda v: device.async_set_audio_volume(int(v)),
-    }
-
-    handler = setting_handlers.get(setting)
-    if not handler:
-        connection.send_error(msg["id"], "invalid_setting", f"Unknown setting: {setting}")
+    if not _validate_setting_value(connection, msg):
         return
 
+    setting = msg["setting"]
+    setting_handlers = {
+        "master_pin_mode": device.async_set_master_pin_mode,
+        "rfid_enabled": device.async_set_rfid_enabled,
+        "require_pin_for_rf": device.async_set_require_pin_for_rf,
+        "service_pin_mode": device.async_set_service_pin_mode,
+        "lock_mode": device.async_set_lock_mode,
+        "relock_enabled": device.async_set_relock,
+        "audio_volume": device.async_set_audio_volume,
+    }
+
+    handler = setting_handlers[setting]
     success = await handler(msg["value"])
     if not success:
         connection.send_error(msg["id"], "device_error", f"Failed to set {setting}")
@@ -538,9 +590,13 @@ async def ws_debug_read_slot(
     result = await _get_lock_and_device(hass, connection, msg, require_device=True)
     if not result:
         return
-    _, _, device = result
+    _, lock, device = result
 
-    raw = await device.async_get_pin_raw(int(msg["slot"]))
+    slot = _validate_slot(connection, msg, lock)
+    if slot is None:
+        return
+
+    raw = await device.async_get_pin_raw(slot)
     connection.send_result(msg["id"], raw)
 
 

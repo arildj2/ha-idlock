@@ -1,6 +1,6 @@
 // Lit is vendored locally (frontend/lit-all.min.js, official lit/dist@3 bundle)
 // so the panel works without internet access and avoids CDN supply-chain risk.
-import { LitElement, html, css, live } from "./lit-all.min.js";
+import { LitElement, html, css, live } from "./lit-all.min.js?v=33";
 
 class HaIdlockPanel extends LitElement {
   static get properties() {
@@ -16,6 +16,7 @@ class HaIdlockPanel extends LitElement {
       _busyAction: { type: String },
       _error: { type: String },
       _settings: { type: Object },
+      _settingsLoading: { type: Boolean },
       _pendingSettings: { type: Object },
       _dirty: { type: Object },
       _revealedPins: { type: Object },
@@ -27,6 +28,7 @@ class HaIdlockPanel extends LitElement {
     this._locks = [];
     this._selected = null;
     this._settings = null;
+    this._settingsLoading = false;
     this._busy = false;
     this._busySlot = 0;
     this._busyAction = "";
@@ -34,11 +36,13 @@ class HaIdlockPanel extends LitElement {
     this._dirty = {};  // { slotNum: { label: "...", pin: "..." } }
     this._pendingSettings = {};  // { setting_name: value } — unsaved setting changes
     this._revealedPins = {};  // { slotNum: "1234" | "loading" }
+    this._refreshRequest = 0;
+    this._settingsRequest = 0;
   }
 
   connectedCallback() {
     super.connectedCallback();
-    this._refresh();
+    if (this.hass) this._refresh();
     // Refresh when returning from idle/sleep/tab switch
     this._visibilityHandler = () => {
       if (document.visibilityState === "visible") {
@@ -48,7 +52,8 @@ class HaIdlockPanel extends LitElement {
         this.style.display = "none";
         this.offsetHeight; // force reflow
         this.style.display = "";
-        setTimeout(() => {
+        clearTimeout(this._visibilityTimer);
+        this._visibilityTimer = setTimeout(() => {
           if (this.hass) {
             this._refresh();
           }
@@ -63,6 +68,7 @@ class HaIdlockPanel extends LitElement {
     if (this._visibilityHandler) {
       document.removeEventListener("visibilitychange", this._visibilityHandler);
     }
+    clearTimeout(this._visibilityTimer);
   }
 
   updated(changedProperties) {
@@ -85,53 +91,63 @@ class HaIdlockPanel extends LitElement {
   }
 
   async _refresh() {
+    if (!this.hass) return;
+    const request = ++this._refreshRequest;
     try {
       this._error = "";
-      this._locks = await this._ws("idlock/list_locks");
-      if (this._selected) {
-        const updated = this._locks.find(
-          (l) => l.device_ieee === this._selected.device_ieee
-        );
-        if (updated) this._selected = updated;
-      } else if (this._locks.length > 0) {
-        this._selected = this._locks[0];
+      const locks = await this._ws("idlock/list_locks");
+      if (request !== this._refreshRequest) return;
+
+      const previousIeee = this._selected?.device_ieee;
+      const selected =
+        locks.find((lock) => lock.device_ieee === previousIeee) ??
+        locks[0] ??
+        null;
+      this._locks = locks;
+      this._selected = selected;
+
+      if (selected?.device_ieee !== previousIeee) {
+        this._settings = null;
+        this._pendingSettings = {};
+        this._dirty = {};
+        this._revealedPins = {};
       }
-      // Always load settings for the selected lock if not yet loaded
-      if (this._selected && !this._settings) {
-        this._loadSettings(this._selected.device_ieee);
-      }
+
     } catch (e) {
+      if (request !== this._refreshRequest) return;
       this._error = e.message || "Failed to load locks";
     }
   }
 
   async _readFromLock() {
     if (!this._selected) return;
+    const ieee = this._selected.device_ieee;
     this._busy = true;
     this._busyAction = "Syncing from lock...";
     try {
-      const result = await this._ws("idlock/read_all_codes", {
-        device_ieee: this._selected.device_ieee,
+      await this._ws("idlock/read_all_codes", {
+        device_ieee: ieee,
       });
-      this._selected = result;
       await this._refresh();
-      // Reload settings (only hits Zigbee if not already loaded)
-      await this._loadSettings(this._selected.device_ieee);
+      if (this._selected?.device_ieee === ieee) {
+        await this._loadSettings(ieee);
+      }
     } catch (e) {
       this._error = e.message || "Failed to read from lock";
+    } finally {
+      this._busy = false;
+      this._busyAction = "";
     }
-    this._busy = false;
-    this._busyAction = "";
   }
 
-  async _setCode(slotNum, code, label) {
+  async _setCode(slotNum, code, label, action = "Setting PIN...") {
     if (!code || !/^\d{4,10}$/.test(code)) {
       this._error = "PIN must be 4-10 digits";
-      return;
+      return false;
     }
     this._busy = true;
     this._busySlot = slotNum;
-    this._busyAction = "Setting PIN...";
+    this._busyAction = action;
     this._error = "";
     try {
       await this._ws("idlock/set_code", {
@@ -141,12 +157,15 @@ class HaIdlockPanel extends LitElement {
         label: label || "",
       });
       await this._refresh();
+      return true;
     } catch (e) {
       this._error = e.message || "Failed to set code";
+      return false;
+    } finally {
+      this._busy = false;
+      this._busySlot = 0;
+      this._busyAction = "";
     }
-    this._busy = false;
-    this._busySlot = 0;
-    this._busyAction = "";
   }
 
   _handlePinInput(slot, e) {
@@ -199,10 +218,11 @@ class HaIdlockPanel extends LitElement {
       await this._refresh();
     } catch (e) {
       this._error = e.message || "Failed to clear RFID";
+    } finally {
+      this._busy = false;
+      this._busySlot = 0;
+      this._busyAction = "";
     }
-    this._busy = false;
-    this._busySlot = 0;
-    this._busyAction = "";
   }
 
   async _clearCode(slotNum) {
@@ -216,13 +236,17 @@ class HaIdlockPanel extends LitElement {
         device_ieee: this._selected.device_ieee,
         slot: slotNum,
       });
+      const revealedPins = { ...this._revealedPins };
+      delete revealedPins[slotNum];
+      this._revealedPins = revealedPins;
       await this._refresh();
     } catch (e) {
       this._error = e.message || "Failed to clear code";
+    } finally {
+      this._busy = false;
+      this._busySlot = 0;
+      this._busyAction = "";
     }
-    this._busy = false;
-    this._busySlot = 0;
-    this._busyAction = "";
   }
 
   async _toggleCode(slot) {
@@ -240,10 +264,11 @@ class HaIdlockPanel extends LitElement {
       await this._refresh();
     } catch (e) {
       this._error = e.message || "Failed to toggle code";
+    } finally {
+      this._busy = false;
+      this._busySlot = 0;
+      this._busyAction = "";
     }
-    this._busy = false;
-    this._busySlot = 0;
-    this._busyAction = "";
   }
 
   async _commitRow(slot) {
@@ -261,23 +286,33 @@ class HaIdlockPanel extends LitElement {
     }
 
     // Set PIN if changed
+    let saved = false;
     if (newPin) {
-      await this._setCode(slot.slot, newPin, newLabel ?? slot.label ?? "");
+      saved = await this._setCode(
+        slot.slot,
+        newPin,
+        newLabel ?? slot.label ?? ""
+      );
     }
     // Rename if label changed (and no PIN change, since _setCode already sends label)
     else if (newLabel !== undefined) {
-      await this._renameSlot(slot.slot, newLabel);
+      saved = await this._renameSlot(slot.slot, newLabel);
     }
+    if (!saved) return;
 
     // Clear dirty state and PIN input
     delete this._dirty[slot.slot];
     this._dirty = { ...this._dirty };
+    const revealedPins = { ...this._revealedPins };
+    delete revealedPins[slot.slot];
+    this._revealedPins = revealedPins;
     const pinInput = this.shadowRoot.querySelector(`#pin-${slot.slot}`);
     if (pinInput) pinInput.value = "";
   }
 
   async _renameSlot(slotNum, newLabel) {
     this._busy = true;
+    this._error = "";
     try {
       await this._ws("idlock/rename_code", {
         device_ieee: this._selected.device_ieee,
@@ -285,10 +320,13 @@ class HaIdlockPanel extends LitElement {
         label: newLabel,
       });
       await this._refresh();
+      return true;
     } catch (e) {
       this._error = e.message || "Failed to rename";
+      return false;
+    } finally {
+      this._busy = false;
     }
-    this._busy = false;
   }
 
   _markDirty(slotNum, field, value) {
@@ -355,20 +393,51 @@ class HaIdlockPanel extends LitElement {
   }
 
   _selectLock(lock) {
+    if (this._busy || lock.device_ieee === this._selected?.device_ieee) return;
     this._selected = lock;
     this._settings = null;
     this._dirty = {};
     this._pendingSettings = {};
     this._revealedPins = {};
     this._error = "";
-    this._loadSettings(lock.device_ieee);
+  }
+
+  _handleSettingsToggle(event, ieee) {
+    if (
+      event.target.open &&
+      this._selected?.device_ieee === ieee &&
+      !this._settings &&
+      !this._settingsLoading
+    ) {
+      this._loadSettings(ieee);
+    }
   }
 
   async _loadSettings(ieee) {
+    const request = ++this._settingsRequest;
+    this._settingsLoading = true;
     try {
-      this._settings = await this._ws("idlock/get_device_settings", { device_ieee: ieee });
+      const settings = await this._ws("idlock/get_device_settings", {
+        device_ieee: ieee,
+      });
+      if (
+        request === this._settingsRequest &&
+        this._selected?.device_ieee === ieee
+      ) {
+        this._settings = settings;
+      }
     } catch (e) {
-      this._settings = null;
+      if (
+        request === this._settingsRequest &&
+        this._selected?.device_ieee === ieee
+      ) {
+        this._settings = null;
+        this._error = e.message || "Failed to load lock settings";
+      }
+    } finally {
+      if (request === this._settingsRequest) {
+        this._settingsLoading = false;
+      }
     }
   }
 
@@ -414,19 +483,26 @@ class HaIdlockPanel extends LitElement {
     this._busyAction = "Saving settings...";
     this._error = "";
     try {
-      for (const [setting, value] of Object.entries(this._pendingSettings)) {
-        this._settings = await this._ws("idlock/set_device_setting", {
-          device_ieee: this._selected.device_ieee,
+      const ieee = this._selected.device_ieee;
+      for (const [setting, value] of Object.entries({ ...this._pendingSettings })) {
+        const settings = await this._ws("idlock/set_device_setting", {
+          device_ieee: ieee,
           setting,
           value,
         });
+        if (this._selected?.device_ieee === ieee) {
+          this._settings = settings;
+          const pending = { ...this._pendingSettings };
+          delete pending[setting];
+          this._pendingSettings = pending;
+        }
       }
-      this._pendingSettings = {};
     } catch (e) {
       this._error = e.message || "Failed to save settings";
+    } finally {
+      this._busy = false;
+      this._busyAction = "";
     }
-    this._busy = false;
-    this._busyAction = "";
   }
 
   render() {
@@ -508,11 +584,10 @@ class HaIdlockPanel extends LitElement {
 
     const label = nameEl?.value?.trim() || "";
 
-    this._busyAction = "Adding PIN...";
-    await this._setCode(slot, code, label);
+    const saved = await this._setCode(slot, code, label, "Adding PIN...");
 
     // Clear inputs on success
-    if (!this._error) {
+    if (saved) {
       pinEl.value = "";
       if (nameEl) nameEl.value = "";
       const nextFree = this._getNextFreeSlot();
@@ -522,15 +597,6 @@ class HaIdlockPanel extends LitElement {
 
   _renderLockDetail() {
     const lock = this._selected;
-
-    if (!this._settings) {
-      return html`
-        <div class="detail-header"><h2>${lock.name}</h2></div>
-        <div style="display:flex;align-items:center;gap:8px;padding:24px 0;color:var(--secondary-text-color)">
-          <span class="spinner"></span> Loading settings…
-        </div>
-      `;
-    }
 
     const slots = Object.values(lock.slots || {}).sort(
       (a, b) => a.slot - b.slot
@@ -719,9 +785,22 @@ class HaIdlockPanel extends LitElement {
         </div>
       ` : html`<p class="empty" style="margin-top:16px">All ${maxSlots} slots are in use</p>`}
 
-      <details class="settings-section">
+      <details
+        class="settings-section"
+        @toggle=${(event) => this._handleSettingsToggle(event, lock.device_ieee)}
+      >
         <summary>Lock settings</summary>
-        ${this._settings ? this._renderSettings() : html`<p class="empty">Loading settings...</p>`}
+        ${this._settings
+          ? this._renderSettings()
+          : this._settingsLoading
+            ? html`<p class="empty"><span class="spinner"></span> Loading settings...</p>`
+            : html`
+                <p class="empty">Settings are unavailable while the lock is asleep.</p>
+                <button
+                  class="btn-secondary"
+                  @click=${() => this._loadSettings(lock.device_ieee)}
+                >Retry</button>
+              `}
       </details>
     `;
   }

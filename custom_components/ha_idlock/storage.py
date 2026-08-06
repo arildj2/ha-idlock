@@ -49,18 +49,39 @@ class IDLockStore:
     async def async_load(self) -> None:
         """Load locks from persistent storage."""
         data = await self._store.async_load()
-        if not data:
+        if not isinstance(data, dict):
             self.locks = {}
             return
 
         self.locks = {}
-        for ieee, raw in data.get("locks", {}).items():
+        raw_locks = data.get("locks", {})
+        if not isinstance(raw_locks, dict):
+            return
+
+        for ieee, raw in raw_locks.items():
             if not isinstance(raw, dict) or not raw.get("entity_id"):
                 continue  # skip malformed entries rather than failing setup
+
+            try:
+                max_slots = max(1, min(255, int(raw.get("max_slots", 25))))
+            except (TypeError, ValueError):
+                max_slots = 25
+
             slots: dict[int, Slot] = {}
-            for k, v in raw.get("slots", {}).items():
-                slots[int(k)] = Slot(
-                    slot=int(k),
+            raw_slots = raw.get("slots", {})
+            if not isinstance(raw_slots, dict):
+                raw_slots = {}
+            for k, v in raw_slots.items():
+                if not isinstance(v, dict):
+                    continue
+                try:
+                    slot_num = int(k)
+                except (TypeError, ValueError):
+                    continue
+                if not 1 <= slot_num <= max_slots:
+                    continue
+                slots[slot_num] = Slot(
+                    slot=slot_num,
                     label=v.get("label", ""),
                     enabled=v.get("enabled", True),
                     has_code=v.get("has_code", False),
@@ -70,7 +91,7 @@ class IDLockStore:
                 name=raw.get("name") or raw["entity_id"],
                 entity_id=raw["entity_id"],
                 device_ieee=ieee,
-                max_slots=raw.get("max_slots", 25),
+                max_slots=max_slots,
                 custom_name=raw.get("custom_name", False),
                 slots=slots,
             )

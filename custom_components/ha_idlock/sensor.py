@@ -16,10 +16,10 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 
 from .const import CONF_LOCKS, DOMAIN, EVENT_IDLOCK, EVENT_IDLOCK_CODE_CHANGED
+from .storage import IDLockStore
 
 _LOGGER = logging.getLogger(__name__)
 
-STATE_LOCKED = "locked"
 STATE_UNLOCKED = "unlocked"
 
 
@@ -131,6 +131,7 @@ class IDLockLastEventSensor(IDLockEventSensorBase):
         """Unsubscribe on removal."""
         if self._unsub:
             self._unsub()
+        await super().async_will_remove_from_hass()
 
 
 class IDLockCodeChangeSensor(IDLockEventSensorBase):
@@ -183,6 +184,7 @@ class IDLockCodeChangeSensor(IDLockEventSensorBase):
         """Unsubscribe on removal."""
         if self._unsub:
             self._unsub()
+        await super().async_will_remove_from_hass()
 
 
 class IDLockLastPersonSensor(IDLockEventSensorBase):
@@ -235,7 +237,6 @@ class IDLockLastPersonSensor(IDLockEventSensorBase):
     async def async_added_to_hass(self) -> None:
         """Subscribe to lock events and state changes."""
         await super().async_added_to_hass()
-        from .storage import IDLockStore
 
         @callback
         def _handle_event(event: Event) -> None:
@@ -247,6 +248,8 @@ class IDLockLastPersonSensor(IDLockEventSensorBase):
             source = data.get("source", "unknown")
             operation = data.get("operation", "unknown")
             code_slot = data.get("code_slot", 0)
+            if operation != "unlock":
+                return
 
             # Resolve person name from slot label in store
             person = ""
@@ -274,10 +277,7 @@ class IDLockLastPersonSensor(IDLockEventSensorBase):
                 return
 
             new_val = new_state.state
-            old_val = old_state.state
-            if new_val not in (STATE_LOCKED, STATE_UNLOCKED):
-                return
-            if new_val == old_val:
+            if new_val != STATE_UNLOCKED or new_val == old_state.state:
                 return
 
             # Skip if we just got an operation event within the grace period
@@ -285,8 +285,7 @@ class IDLockLastPersonSensor(IDLockEventSensorBase):
             if now_ts - self._last_event_time < self._STATE_GRACE_SECONDS:
                 return
 
-            operation = "unlock" if new_val == STATE_UNLOCKED else "lock"
-            self._update_person("unknown", operation, "unknown", 0)
+            self._update_person("unknown", "unlock", "unknown", 0)
 
         self._unsub_event = self.hass.bus.async_listen(EVENT_IDLOCK, _handle_event)
         self._unsub_state = async_track_state_change_event(
@@ -299,3 +298,4 @@ class IDLockLastPersonSensor(IDLockEventSensorBase):
             self._unsub_event()
         if self._unsub_state:
             self._unsub_state()
+        await super().async_will_remove_from_hass()

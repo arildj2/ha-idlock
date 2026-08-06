@@ -50,7 +50,7 @@ Both models expose identical Zigbee capabilities. The only difference is that th
 
 > Note: Service PIN modes 5 and 6 (random PIN) require lock firmware ≥ 1.5.5. To see the generated random PIN, enter **[Master PIN] + [*] + [8]** on the lock keypad.
 
-> Note: Manufacturer-specific attributes are written using zigpy's `_write_attributes` with manufacturer code 4919 (Datek), following the same pattern as [zha-toolkit](https://github.com/mdeweerd/zha-toolkit).
+> Note: Manufacturer-specific attributes are written using zigpy's `write_attributes_raw` with manufacturer code 4919 (Datek), avoiding private zigpy APIs while supporting attributes that are not registered on the standard DoorLock cluster.
 
 ## Architecture
 
@@ -94,21 +94,21 @@ The ID Lock 150/202 are battery-powered Zigbee EndDevices that sleep to conserve
 | Set/Clear/Enable/Disable PIN | **1 command** | User-initiated from panel |
 | Change lock setting | **1 command** | User-initiated from panel |
 | "Sync from lock" full read | **50 commands** | Manual button (reads 25 PIN + 25 RFID slots) |
-| HA startup | **Zero** | Device lookup is local; attribute reads run in background |
+| HA startup | **Zero** | Device lookup is local; no lock reads are performed |
 
 After initial setup, the integration stays in sync via push notifications from the lock — **no polling, no periodic reads**.
 
 ### How Code Sync Works
 
-1. **On first setup**: The integration reads all 25 PIN + 25 RFID slots in the background to discover existing codes
+1. **On first setup**: The integration starts with an empty local slot index; use **Sync from lock** once to discover codes already stored in the lock
 2. **When you set/clear via the panel**: Single command to lock, then store updates locally
 3. **When someone adds/changes/deletes a code via the lock keypad**: The lock sends a `programming_event_notification` → integration updates its store and fires an event — **zero battery cost**
-4. **"Sync from lock" button**: Manual full re-read for when you need to reconcile (e.g., after enrolling an RFID tag on the lock)
-5. **No background polling** — Unlike Z-Wave integrations that can poll for free (cached data), Zigbee has no cache layer, so we never poll
+4. **"Sync from lock" button**: Manual full re-read for reconciliation (for example, after enrolling an RFID tag on the lock)
+5. **No background polling** — Unlike Z-Wave integrations that can poll for free (cached data), Zigbee has no cache layer, so this integration never polls
 
 ### Non-Blocking Startup
 
-The integration starts instantly without waiting for Zigbee devices. Device connections and attribute reads run in a background task after HA is fully loaded, so the integration never blocks HA startup — even if locks are asleep.
+The integration starts without sending Zigbee requests. Device lookup uses ZHA's local device registry; hardware attributes are read only when the settings panel is opened or opportunistically while a lock is known to be awake.
 
 ## Installation
 
@@ -167,10 +167,11 @@ After setup, an **"ID Lock"** entry appears in the HA sidebar. The panel provide
 
 ### Sensors
 
-For each managed lock, two sensor entities are created:
+For each managed lock, three sensor entities are created:
 
 - **`sensor.<name>_last_event`** — Last lock/unlock event with source (keypad/RF/manual/RFID), operation, and code slot number
 - **`sensor.<name>_code_change`** — Last code programming event (pin_added/pin_deleted/pin_changed/rfid_added/rfid_deleted) with source and slot number
+- **`sensor.<name>_last_person`** — Name assigned to the slot that most recently unlocked the door, with source and slot details
 
 ### Events for Automations
 
