@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from homeassistant.components.frontend import async_register_built_in_panel, async_remove_panel
+from homeassistant.components.frontend import (
+    async_register_built_in_panel,
+    async_remove_panel,
+)
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.core import HomeAssistant
 

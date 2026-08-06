@@ -10,11 +10,14 @@
     },
     "abort": {
       "already_configured": "Already configured. Only a single instance is supported — use Configure to add or remove locks."
+    },
+    "error": {
+      "no_valid_locks": "Select at least one valid ZHA lock entity."
     }
   },
   "options": {
     "step": {
-      "main": {
+      "init": {
         "title": "ID Lock Settings",
         "data": {
           "locks": "ZHA lock entities"

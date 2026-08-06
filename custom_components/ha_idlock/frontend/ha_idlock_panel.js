@@ -1,8 +1,8 @@
-// Lit is vendored locally (frontend/lit-all.min.js, official lit/dist@3 bundle)
+// Lit 3.3.3 is vendored locally (frontend/lit-all.min.js; BSD-3-Clause)
 // so the panel works without internet access and avoids CDN supply-chain risk.
 import { LitElement, html, css, live } from "./lit-all.min.js?v=33";
 
-class HaIdlockPanel extends LitElement {
+export class HaIdlockPanel extends LitElement {
   static get properties() {
     return {
       hass: { type: Object },
@@ -20,6 +20,8 @@ class HaIdlockPanel extends LitElement {
       _pendingSettings: { type: Object },
       _dirty: { type: Object },
       _revealedPins: { type: Object },
+      _visiblePins: { type: Object },
+      _confirmation: { type: Object },
     };
   }
 
@@ -36,8 +38,12 @@ class HaIdlockPanel extends LitElement {
     this._dirty = {};  // { slotNum: { label: "...", pin: "..." } }
     this._pendingSettings = {};  // { setting_name: value } — unsaved setting changes
     this._revealedPins = {};  // { slotNum: "1234" | "loading" }
+    this._visiblePins = {};
+    this._pinHideTimers = new Map();
+    this._confirmation = null;
     this._refreshRequest = 0;
     this._settingsRequest = 0;
+    this._pinRequest = 0;
   }
 
   connectedCallback() {
@@ -69,6 +75,7 @@ class HaIdlockPanel extends LitElement {
       document.removeEventListener("visibilitychange", this._visibilityHandler);
     }
     clearTimeout(this._visibilityTimer);
+    this._clearPinMemory();
   }
 
   updated(changedProperties) {
@@ -79,6 +86,9 @@ class HaIdlockPanel extends LitElement {
       if (!prev) {
         this._refresh();
       }
+    }
+    if (changedProperties.has("_confirmation") && this._confirmation) {
+      queueMicrotask(() => this.shadowRoot?.querySelector(".confirm-danger")?.focus());
     }
   }
 
@@ -110,7 +120,7 @@ class HaIdlockPanel extends LitElement {
         this._settings = null;
         this._pendingSettings = {};
         this._dirty = {};
-        this._revealedPins = {};
+        this._clearPinMemory();
       }
 
     } catch (e) {
@@ -141,8 +151,10 @@ class HaIdlockPanel extends LitElement {
   }
 
   async _setCode(slotNum, code, label, action = "Setting PIN...") {
-    if (!code || !/^\d{4,10}$/.test(code)) {
-      this._error = "PIN must be 4-10 digits";
+    const min = this._settings?.min_pin_len ?? 4;
+    const max = this._settings?.max_pin_len ?? 10;
+    if (!code || !new RegExp(`^\\d{${min},${max}}$`).test(code)) {
+      this._error = `PIN must be ${min}-${max} digits`;
       return false;
     }
     this._busy = true;
@@ -205,7 +217,7 @@ class HaIdlockPanel extends LitElement {
   }
 
   async _clearRfid(slotNum) {
-    if (!confirm(`Remove RFID tag from slot ${slotNum}?`)) return;
+    this._confirmation = null;
     this._busy = true;
     this._busySlot = slotNum;
     this._busyAction = "Clearing RFID...";
@@ -226,7 +238,7 @@ class HaIdlockPanel extends LitElement {
   }
 
   async _clearCode(slotNum) {
-    if (!confirm(`Clear PIN code from slot ${slotNum}?`)) return;
+    this._confirmation = null;
     this._busy = true;
     this._busySlot = slotNum;
     this._busyAction = "Clearing PIN...";
@@ -236,9 +248,7 @@ class HaIdlockPanel extends LitElement {
         device_ieee: this._selected.device_ieee,
         slot: slotNum,
       });
-      const revealedPins = { ...this._revealedPins };
-      delete revealedPins[slotNum];
-      this._revealedPins = revealedPins;
+      this._hidePin(slotNum);
       await this._refresh();
     } catch (e) {
       this._error = e.message || "Failed to clear code";
@@ -280,8 +290,10 @@ class HaIdlockPanel extends LitElement {
     const newLabel = d.label;
 
     // Validate PIN if changed
-    if (newPin && !/^\d{4,10}$/.test(newPin)) {
-      this._error = "PIN must be 4-10 digits";
+    const min = this._settings?.min_pin_len ?? 4;
+    const max = this._settings?.max_pin_len ?? 10;
+    if (newPin && !new RegExp(`^\\d{${min},${max}}$`).test(newPin)) {
+      this._error = `PIN must be ${min}-${max} digits`;
       return;
     }
 
@@ -303,9 +315,7 @@ class HaIdlockPanel extends LitElement {
     // Clear dirty state and PIN input
     delete this._dirty[slot.slot];
     this._dirty = { ...this._dirty };
-    const revealedPins = { ...this._revealedPins };
-    delete revealedPins[slot.slot];
-    this._revealedPins = revealedPins;
+    this._hidePin(slot.slot);
     const pinInput = this.shadowRoot.querySelector(`#pin-${slot.slot}`);
     if (pinInput) pinInput.value = "";
   }
@@ -362,28 +372,72 @@ class HaIdlockPanel extends LitElement {
   }
 
   async _revealPin(slotNum) {
+    if (this._visiblePins[slotNum]) {
+      this._hidePin(slotNum);
+      return;
+    }
+    const ieee = this._selected?.device_ieee;
+    const request = ++this._pinRequest;
     this._revealedPins = { ...this._revealedPins, [slotNum]: "loading" };
     try {
       const result = await this._ws("idlock/read_pin", {
-        device_ieee: this._selected.device_ieee,
+        device_ieee: ieee,
         slot: slotNum,
       });
+      if (request !== this._pinRequest || this._selected?.device_ieee !== ieee) return;
       const code = result.code || "";
       this._revealedPins = { ...this._revealedPins, [slotNum]: code };
+      this._visiblePins = { ...this._visiblePins, [slotNum]: true };
+      clearTimeout(this._pinHideTimers.get(slotNum));
+      this._pinHideTimers.set(slotNum, setTimeout(() => this._hidePin(slotNum), 30000));
     } catch (e) {
+      if (request !== this._pinRequest || this._selected?.device_ieee !== ieee) return;
       this._revealedPins = { ...this._revealedPins, [slotNum]: "error" };
       this._error = e.message || "Failed to read PIN";
     }
   }
 
-  async _saveMeta(name, maxSlots) {
+  _hidePin(slotNum) {
+    clearTimeout(this._pinHideTimers.get(slotNum));
+    this._pinHideTimers.delete(slotNum);
+    const revealedPins = { ...this._revealedPins };
+    const visiblePins = { ...this._visiblePins };
+    delete revealedPins[slotNum];
+    delete visiblePins[slotNum];
+    this._revealedPins = revealedPins;
+    this._visiblePins = visiblePins;
+  }
+
+  _clearPinMemory() {
+    this._pinRequest += 1;
+    for (const timer of this._pinHideTimers?.values?.() ?? []) clearTimeout(timer);
+    this._pinHideTimers?.clear?.();
+    this._revealedPins = {};
+    this._visiblePins = {};
+  }
+
+  _requestConfirmation(kind, slot) {
+    this._confirmation = { kind, slot };
+  }
+
+  _runConfirmation() {
+    const pending = this._confirmation;
+    if (!pending) return;
+    if (pending.kind === "pin") this._clearCode(pending.slot);
+    else this._clearRfid(pending.slot);
+  }
+
+  _handleConfirmationKeydown(event) {
+    if (event.key === "Escape") this._confirmation = null;
+  }
+
+  async _saveMeta(name) {
     if (!this._selected) return;
     this._busy = true;
     try {
       await this._ws("idlock/save_lock_meta", {
         device_ieee: this._selected.device_ieee,
         name: name ?? this._selected.name,
-        max_slots: maxSlots ?? this._selected.max_slots,
       });
       await this._refresh();
     } catch (e) {
@@ -398,7 +452,7 @@ class HaIdlockPanel extends LitElement {
     this._settings = null;
     this._dirty = {};
     this._pendingSettings = {};
-    this._revealedPins = {};
+    this._clearPinMemory();
     this._error = "";
   }
 
@@ -413,12 +467,13 @@ class HaIdlockPanel extends LitElement {
     }
   }
 
-  async _loadSettings(ieee) {
+  async _loadSettings(ieee, force = false) {
     const request = ++this._settingsRequest;
     this._settingsLoading = true;
     try {
       const settings = await this._ws("idlock/get_device_settings", {
         device_ieee: ieee,
+        ...(force ? { force: true } : {}),
       });
       if (
         request === this._settingsRequest &&
@@ -513,24 +568,49 @@ class HaIdlockPanel extends LitElement {
         </div>
 
         ${this._error
-          ? html`<div class="error">${this._error}</div>`
+          ? html`<div class="error" role="alert">${this._error}</div>`
           : ""}
+
+        ${this._confirmation ? html`
+          <div class="dialog-backdrop" @click=${() => { this._confirmation = null; }}>
+            <section
+              class="confirm-dialog"
+              role="alertdialog"
+              aria-modal="true"
+              aria-labelledby="confirm-title"
+              @click=${(event) => event.stopPropagation()}
+              @keydown=${this._handleConfirmationKeydown}
+            >
+              <h2 id="confirm-title">Remove credential?</h2>
+              <p>
+                ${this._confirmation.kind === "pin" ? "Clear the PIN" : "Remove the RFID tag"}
+                from slot ${this._confirmation.slot}?
+              </p>
+              <div class="confirm-actions">
+                <button class="btn-secondary" @click=${() => { this._confirmation = null; }}>Cancel</button>
+                <button class="btn-primary btn-danger confirm-danger" @click=${this._runConfirmation}>Remove</button>
+              </div>
+            </section>
+          </div>
+        ` : ""}
 
         <div class="layout">
           <div class="lock-list">
             <h2>Locks</h2>
             ${this._locks.map(
               (lock) => html`
-                <div
+                <button
+                  type="button"
                   class="lock-item ${this._selected?.device_ieee ===
                   lock.device_ieee
                     ? "selected"
                     : ""}"
+                  aria-pressed=${this._selected?.device_ieee === lock.device_ieee ? "true" : "false"}
                   @click=${() => this._selectLock(lock)}
                 >
                   <ha-icon icon="mdi:lock-smart"></ha-icon>
                   <span>${lock.name}</span>
-                </div>
+                </button>
               `
             )}
             ${this._locks.length === 0
@@ -577,8 +657,10 @@ class HaIdlockPanel extends LitElement {
     }
 
     const code = pinEl.value.trim();
-    if (!code || !/^\d{4,10}$/.test(code)) {
-      this._error = "PIN must be 4-10 digits";
+    const minPin = this._settings?.min_pin_len ?? 4;
+    const maxPin = this._settings?.max_pin_len ?? 10;
+    if (!code || !new RegExp(`^\\d{${minPin},${maxPin}}$`).test(code)) {
+      this._error = `PIN must be ${minPin}-${maxPin} digits`;
       return;
     }
 
@@ -607,6 +689,8 @@ class HaIdlockPanel extends LitElement {
     const pinCount = slots.filter((s) => s.has_code).length;
     const rfidCount = slots.filter((s) => s.has_rfid).length;
     const maxSlots = lock.max_slots || 25;
+    const minPin = this._settings?.min_pin_len ?? 4;
+    const maxPin = this._settings?.max_pin_len ?? 10;
 
     return html`
       <div class="detail-header">
@@ -630,6 +714,7 @@ class HaIdlockPanel extends LitElement {
 
       ${activeSlots.length > 0
         ? html`
+          <div class="table-scroll" role="region" aria-label="Lock credentials" tabindex="0">
             <table class="slots-table">
               <thead>
                 <tr>
@@ -655,6 +740,7 @@ class HaIdlockPanel extends LitElement {
                           class="label-input"
                           .value=${slot.label || ""}
                           placeholder="unnamed"
+                          aria-label="Name for slot ${slot.slot}"
                           maxlength="30"
                           @input=${(e) => this._handleLabelInput(slot, e)}
                           @keydown=${(e) => this._handleLabelKeydown(slot, e)}
@@ -670,24 +756,26 @@ class HaIdlockPanel extends LitElement {
                                 <button class="btn-reveal"
                                   @click=${() => this._revealPin(slot.slot)}
                                   ?disabled=${this._busy || this._revealedPins[slot.slot] === "loading"}
+                                  aria-label="${this._visiblePins[slot.slot] ? "Hide" : "Read and show"} PIN for slot ${slot.slot}"
                                   title="Read PIN from lock">
                                   ${this._revealedPins[slot.slot] === "loading"
                                     ? html`<span class="spinner-tiny"></span>`
-                                    : html`<ha-icon icon="mdi:eye-outline"></ha-icon>`}
+                                    : html`<ha-icon icon="${this._visiblePins[slot.slot] ? "mdi:eye-off-outline" : "mdi:eye-outline"}"></ha-icon>`}
                                 </button>
                               </div>`
                             : ""}
                           <input
-                            type="text"
+                            type=${this._visiblePins[slot.slot] ? "text" : "password"}
                             inputmode="numeric"
                             pattern="[0-9]*"
-                            class="pin-input" autocomplete="off"
+                            class="pin-input" autocomplete="new-password"
+                            aria-label="PIN for slot ${slot.slot}"
                             id="pin-${slot.slot}"
                             .value=${live(this._dirty[slot.slot]?.pin ?? (this._revealedPins[slot.slot]?.match?.(/^\d+$/) ? this._revealedPins[slot.slot] : ""))}
                             placeholder="${slot.has_code ? "new PIN" : "set PIN"}"
                             @input=${(e) => { e.target.value = e.target.value.replace(/\D/g, ""); this._handlePinInput(slot, e); }}
                             @keydown=${(e) => this._handlePinKeydown(slot, e)}
-                            maxlength="10"
+                            maxlength=${maxPin}
                             ?disabled=${this._busy}
                           />
                         </div>
@@ -702,24 +790,28 @@ class HaIdlockPanel extends LitElement {
                       <td class="slot-actions">
                         ${this._isDirty(slot.slot) ? html`
                           <button class="btn-sm btn-save" @click=${() => this._commitRow(slot)} ?disabled=${this._busy}
+                            aria-label="Save changes for slot ${slot.slot}"
                             title="Save changes">
                             <ha-icon icon="mdi:content-save"></ha-icon> Save
                           </button>
                         ` : html`
                           ${slot.has_code ? html`
                             <button class="btn-sm" @click=${() => this._toggleCode(slot)} ?disabled=${this._busy}
+                              aria-label="${slot.enabled ? "Disable" : "Enable"} PIN for slot ${slot.slot}"
                               title="${slot.enabled ? "Disable PIN" : "Enable PIN"}">
                               ${slot.enabled
                                 ? html`<ha-icon icon="mdi:pause-circle-outline"></ha-icon>`
                                 : html`<ha-icon icon="mdi:play-circle-outline"></ha-icon>`}
                             </button>
-                            <button class="btn-sm btn-danger" @click=${() => this._clearCode(slot.slot)} ?disabled=${this._busy}
+                            <button class="btn-sm btn-danger" @click=${() => this._requestConfirmation("pin", slot.slot)} ?disabled=${this._busy}
+                              aria-label="Clear PIN from slot ${slot.slot}"
                               title="Clear PIN">
                               <ha-icon icon="mdi:close-circle-outline"></ha-icon>
                             </button>
                           ` : ""}
                           ${slot.has_rfid ? html`
-                            <button class="btn-sm btn-danger" @click=${() => this._clearRfid(slot.slot)} ?disabled=${this._busy}
+                            <button class="btn-sm btn-danger" @click=${() => this._requestConfirmation("rfid", slot.slot)} ?disabled=${this._busy}
+                              aria-label="Clear RFID from slot ${slot.slot}"
                               title="Clear RFID">
                               <ha-icon icon="mdi:card-remove-outline"></ha-icon>
                             </button>
@@ -731,6 +823,7 @@ class HaIdlockPanel extends LitElement {
                 )}
               </tbody>
             </table>
+          </div>
           `
         : html`
             <div class="empty-state">
@@ -748,6 +841,7 @@ class HaIdlockPanel extends LitElement {
             inputmode="numeric"
             class="add-slot-input"
             id="add-slot"
+            aria-label="New user slot"
             placeholder="Slot"
             .value=${String(this._getNextFreeSlot() || "")}
             @input=${(e) => { e.target.value = e.target.value.replace(/\D/g, ""); }}
@@ -758,18 +852,21 @@ class HaIdlockPanel extends LitElement {
             type="text"
             class="label-input add-name-input"
             id="add-name"
+            aria-label="New user name"
             placeholder="Name"
             maxlength="30"
             ?disabled=${this._busy}
           />
           <input
-            type="text"
+            type="password"
             inputmode="numeric"
             pattern="[0-9]*"
             class="pin-input add-pin-input"
             id="add-pin"
-            placeholder="PIN (4-10 digits)"
-            maxlength="10"
+            autocomplete="new-password"
+            aria-label="New user PIN"
+            placeholder="PIN (${minPin}-${maxPin} digits)"
+            maxlength=${maxPin}
             @input=${(e) => { e.target.value = e.target.value.replace(/\D/g, ""); }}
             @keydown=${(e) => {
               if (e.key === "Enter") { this._submitAddCode(); return; }
@@ -798,7 +895,7 @@ class HaIdlockPanel extends LitElement {
                 <p class="empty">Settings are unavailable while the lock is asleep.</p>
                 <button
                   class="btn-secondary"
-                  @click=${() => this._loadSettings(lock.device_ieee)}
+                  @click=${() => this._loadSettings(lock.device_ieee, true)}
                 >Retry</button>
               `}
       </details>
@@ -849,20 +946,28 @@ class HaIdlockPanel extends LitElement {
     ];
 
     return html`
-      ${fwInfo}
+      <div class="settings-toolbar">
+        ${fwInfo}
+        <button
+          class="btn-secondary"
+          @click=${() => this._loadSettings(lock.device_ieee, true)}
+          ?disabled=${this._busy || this._settingsLoading || this._hasSettingsChanges}
+        >Refresh settings</button>
+      </div>
       <div class="settings-grid">
         <div class="setting-group">
           <h3>General</h3>
 
           <div class="setting-row">
             <label>Lock name</label>
-            <input type="text" .value=${lock.name}
-              @change=${(e) => { this._saveMeta(e.target.value, lock.max_slots); }} />
+            <input type="text" .value=${lock.name} aria-label="Lock name"
+              @change=${(e) => { this._saveMeta(e.target.value); }} />
           </div>
 
           <div class="setting-row">
             <label>Audio volume</label>
             <select .value=${String(val("audio_volume", ""))}
+              aria-label="Audio volume"
               @change=${(e) => this._stageSetting("audio_volume", parseInt(e.target.value))}
               ?disabled=${this._busy}>
               ${volumeOptions.map(o => html`
@@ -879,6 +984,7 @@ class HaIdlockPanel extends LitElement {
             <div class="setting-row">
               <label>Master PIN can unlock</label>
               <input type="checkbox" .checked=${val("master_pin_mode", true)}
+                aria-label="Master PIN can unlock"
                 @change=${(e) => this._stageSetting("master_pin_mode", e.target.checked)}
                 ?disabled=${this._busy} />
             </div>
@@ -886,6 +992,7 @@ class HaIdlockPanel extends LitElement {
             <div class="setting-row">
               <label>RFID enabled</label>
               <input type="checkbox" .checked=${val("rfid_enabled", true)}
+                aria-label="RFID enabled"
                 @change=${(e) => this._stageSetting("rfid_enabled", e.target.checked)}
                 ?disabled=${this._busy} />
             </div>
@@ -894,6 +1001,7 @@ class HaIdlockPanel extends LitElement {
           <div class="setting-row">
             <label>Require PIN for RF</label>
             <input type="checkbox" .checked=${val("require_pin_for_rf", false)}
+              aria-label="Require PIN for RF"
               @change=${(e) => this._stageSetting("require_pin_for_rf", e.target.checked)}
               ?disabled=${this._busy} />
           </div>
@@ -913,6 +1021,7 @@ class HaIdlockPanel extends LitElement {
                 <div class="setting-hint">Automatically locks after the door is closed</div>
               </div>
               <input type="checkbox" .checked=${!!autoLockOn}
+                aria-label="Auto-lock"
                 @change=${(e) => this._stageSettingLockModeBit(1, e.target.checked)}
                 ?disabled=${this._busy} />
             </div>
@@ -923,6 +1032,7 @@ class HaIdlockPanel extends LitElement {
                 <div class="setting-hint">Requires both PIN and RFID to unlock</div>
               </div>
               <input type="checkbox" .checked=${!!awayModeOn}
+                aria-label="Away mode"
                 @change=${(e) => this._stageSettingLockModeBit(2, e.target.checked)}
                 ?disabled=${this._busy} />
             </div>
@@ -930,6 +1040,7 @@ class HaIdlockPanel extends LitElement {
             <div class="setting-row">
               <label>Auto-relock</label>
               <input type="checkbox" .checked=${val("relock_enabled", false)}
+                aria-label="Auto-relock"
                 @change=${(e) => this._stageSetting("relock_enabled", e.target.checked)}
                 ?disabled=${this._busy} />
               <span class="setting-hint">Re-locks if unlocked but the door was never opened</span>
@@ -938,6 +1049,7 @@ class HaIdlockPanel extends LitElement {
             <div class="setting-row">
               <label>Service PIN</label>
               <select .value=${String(svcMode)}
+                aria-label="Service PIN mode"
                 @change=${(e) => this._stageSetting("service_pin_mode", parseInt(e.target.value))}
                 ?disabled=${this._busy}>
                 ${servicePinOptions.map(o => html`
@@ -1023,8 +1135,17 @@ class HaIdlockPanel extends LitElement {
         border-radius: 8px;
         cursor: pointer;
         transition: background 0.15s;
+        width: 100%;
+        border: 0;
+        background: transparent;
+        color: inherit;
+        text-align: left;
       }
       .lock-item:hover { background: var(--secondary-background-color, #f0f0f0); }
+      .lock-item:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible {
+        outline: 2px solid var(--primary-color, #03a9f4);
+        outline-offset: 2px;
+      }
       .lock-item.selected {
         background: var(--primary-color, #03a9f4);
         color: white;
@@ -1116,6 +1237,12 @@ class HaIdlockPanel extends LitElement {
 
       .firmware-info {
         display: flex; gap: 8px; padding: 8px 0; flex-wrap: wrap;
+      }
+      .settings-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
       }
       .fw-badge {
         font-size: 12px; padding: 2px 8px; border-radius: 4px;
@@ -1227,7 +1354,8 @@ class HaIdlockPanel extends LitElement {
       .meta-section input[type="number"] { width: 60px; }
       .meta-section input[type="text"] { width: 150px; }
 
-      .slots-table { width: 100%; border-collapse: collapse; }
+      .table-scroll { width: 100%; overflow-x: auto; }
+      .slots-table { width: 100%; min-width: 720px; border-collapse: collapse; }
       .slots-table th {
         text-align: left;
         padding: 8px;
@@ -1378,9 +1506,34 @@ class HaIdlockPanel extends LitElement {
 
       .empty { color: var(--secondary-text-color, #999); font-style: italic; }
 
+      .dialog-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 1000;
+        display: grid;
+        place-items: center;
+        padding: 20px;
+        background: rgba(0, 0, 0, 0.45);
+      }
+      .confirm-dialog {
+        width: min(420px, 100%);
+        box-sizing: border-box;
+        padding: 20px;
+        border-radius: 12px;
+        background: var(--card-background-color, #fff);
+        color: var(--primary-text-color, #333);
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+      }
+      .confirm-dialog h2 { margin: 0 0 8px; font-size: 20px; }
+      .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+      .confirm-actions .btn-danger { background: var(--error-color, #db4437); }
+
       @media (max-width: 900px) {
         .meta-section { flex-direction: column; align-items: stretch; }
         .slot-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+        .detail-header { align-items: flex-start; gap: 8px; flex-direction: column; }
+        .stats-bar { flex-wrap: wrap; gap: 8px; }
+        .settings-toolbar { align-items: stretch; flex-direction: column; }
       }
     `;
   }

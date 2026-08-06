@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from typing import Any
 
-from zigpy.types import EUI64, uint8_t as zigpy_uint8, uint16_t as zigpy_uint16
-from zigpy.zcl.foundation import Attribute, TypeValue
-
 from homeassistant.core import HomeAssistant
+from zigpy.types import EUI64
+from zigpy.types import uint8_t as zigpy_uint8
+from zigpy.types import uint16_t as zigpy_uint16
+from zigpy.zcl.foundation import Attribute, TypeValue
 
 from .const import (
     ATTR_AUDIO_VOLUME,
@@ -32,6 +32,8 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+SETTINGS_CACHE_TTL = 300.0
 
 
 class IDLockDevice:
@@ -66,7 +68,10 @@ class IDLockDevice:
         self.module_build: str | None = None       # 0x4000: Zigbee module build (e.g. "0.7")
 
         # IDLock manufacturer-specific settings
-        self._info_lock = asyncio.Lock()
+        # ID Lock is a sleepy battery device. Keep every request to one lock in
+        # a single queue so panel tabs, automations, and wake events cannot race.
+        self._operation_lock = asyncio.Lock()
+        self._settings_updated_at: float | None = None
         self.mfr_attrs_supported: bool | None = None  # None=unknown, True/False after first read
         self.master_pin_mode: bool | None = None
         self.rfid_enabled: bool | None = None
@@ -116,23 +121,36 @@ class IDLockDevice:
         _LOGGER.debug("[IDLock] Connected to %s", self.ieee)
         return True
 
-    async def async_read_device_info(self, timeout: float = 15.0) -> None:
-        """Read capabilities and IDLock attributes from the device (sends Zigbee commands)."""
-        # Await an in-flight read rather than returning partially populated data
-        # or sending the same group of Zigbee requests twice.
-        read_in_progress = self._info_lock.locked()
-        async with self._info_lock:
-            if read_in_progress:
+    def settings_are_fresh(self) -> bool:
+        """Return whether cached settings are still within their TTL."""
+        if self._settings_updated_at is None:
+            return False
+        return (
+            asyncio.get_running_loop().time() - self._settings_updated_at
+            < SETTINGS_CACHE_TTL
+        )
+
+    async def async_read_device_info(
+        self, timeout: float = 15.0, *, force: bool = False
+    ) -> None:
+        """Read device info within one overall timeout and operation queue."""
+        if not force and self.settings_are_fresh():
+            return
+        async with self._operation_lock:
+            if not force and self.settings_are_fresh():
                 return
             try:
-                await asyncio.wait_for(self._read_firmware_versions(), timeout=timeout)
+                async with asyncio.timeout(timeout):
+                    await self._read_firmware_versions()
+                    await self._read_capabilities()
+                    await self._read_idlock_attributes()
             except TimeoutError:
-                _LOGGER.warning("[IDLock] Timeout reading firmware for %s (lock may be asleep)", self.ieee)
-            try:
-                await asyncio.wait_for(self._read_capabilities(), timeout=timeout)
-            except TimeoutError:
-                _LOGGER.warning("[IDLock] Timeout reading capabilities for %s (lock may be asleep)", self.ieee)
-            await self._read_idlock_attributes(timeout=timeout)
+                _LOGGER.warning(
+                    "[IDLock] Timed out reading device info for %s after %.1fs "
+                    "(lock may be asleep)",
+                    self.ieee,
+                    timeout,
+                )
             _LOGGER.debug(
                 "[IDLock] Read device info for %s (fw=%s, module=%s, %d PIN slots, %d RFID slots, PIN %d-%d digits)",
                 self.ieee,
@@ -174,7 +192,7 @@ class IDLockDevice:
 
         # Read manufacturer-specific lock firmware (0x5000) with Datek mfr code
         try:
-            raw_result = await basic_cluster._read_attributes(  # noqa: SLF001
+            raw_result = await basic_cluster.read_attributes_raw(
                 [ATTR_LOCK_FW_VERSION],
                 manufacturer=IDLOCK_MANUFACTURER_CODE,
             )
@@ -228,30 +246,25 @@ class IDLockDevice:
         except Exception:  # noqa: BLE001
             _LOGGER.debug("[IDLock] Could not read capabilities for %s", self.ieee)
 
-    async def _read_idlock_attributes(self, timeout: float = 15.0) -> None:
+    async def _read_idlock_attributes(self) -> None:
         """Read IDLock manufacturer-specific attributes (0x4000-0x4006).
 
         These require the Datek manufacturer code (4919) to be passed.
         Also reads the standard sound_volume (0x0024) as fallback for audio.
 
-        Uses an explicit timeout to fail fast on sleepy locks that don't
-        respond to attribute reads (the lock may only respond to commands).
+        The caller owns the overall timeout for this group of reads.
         """
         # Read standard sound_volume first (known to work from diagnostic)
         try:
-            result = await asyncio.wait_for(
-                self._cluster.read_attributes(["sound_volume"]),
-                timeout=timeout,
-            )
+            result = await self._cluster.read_attributes(["sound_volume"])
             attrs = result[0] if isinstance(result, (list, tuple)) else result
             if "sound_volume" in attrs and attrs["sound_volume"] is not None:
                 self.audio_volume = int(attrs["sound_volume"])
         except Exception:  # noqa: BLE001
             pass
 
-        # Read manufacturer-specific attributes using the internal _read_attributes
-        # method to bypass zigpy's find_attribute() lookup which requires attributes
-        # to be registered on the cluster class (not just the instance).
+        # read_attributes_raw is zigpy's public API for attributes which are not
+        # registered on the cluster class.
         mfr_attr_ids = [
             ATTR_MASTER_PIN_MODE,
             ATTR_RFID_ENABLED,
@@ -261,12 +274,9 @@ class IDLockDevice:
             ATTR_AUDIO_VOLUME,
         ]
         try:
-            raw_result = await asyncio.wait_for(
-                self._cluster._read_attributes(  # noqa: SLF001
-                    mfr_attr_ids,
-                    manufacturer=IDLOCK_MANUFACTURER_CODE,
-                ),
-                timeout=timeout,
+            raw_result = await self._cluster.read_attributes_raw(
+                mfr_attr_ids,
+                manufacturer=IDLOCK_MANUFACTURER_CODE,
             )
             # _read_attributes returns (list_of_records, ...) — parse attribute records
             records = raw_result[0] if isinstance(raw_result, (list, tuple)) else []
@@ -298,6 +308,7 @@ class IDLockDevice:
                 self.audio_volume = int(attrs[ATTR_AUDIO_VOLUME])
 
             self.mfr_attrs_supported = bool(attrs)
+            self._settings_updated_at = asyncio.get_running_loop().time()
 
             _LOGGER.debug(
                 "[IDLock] %s: master_pin=%s, rfid=%s, service_pin=%s, "
@@ -323,14 +334,14 @@ class IDLockDevice:
         """Try reading settings with a short timeout — call when lock is known awake.
 
         Returns True if mfr attributes were successfully read.
-        Skips if already loaded or previously confirmed unsupported.
+        Skips while the five-minute cache is fresh.
         """
-        if self.mfr_attrs_supported is True:
-            return True  # Already loaded
+        if self.settings_are_fresh():
+            return self.mfr_attrs_supported is True
         if not self._cluster:
             return False
         _LOGGER.debug("[IDLock] %s: opportunistic settings read (lock should be awake)", self.ieee)
-        await self._read_idlock_attributes(timeout=8.0)
+        await self.async_read_device_info(timeout=8.0)
         return self.mfr_attrs_supported is True
 
     def get_device_info(self) -> dict[str, Any]:
@@ -357,6 +368,11 @@ class IDLockDevice:
 
     async def async_get_pin(self, slot: int) -> dict[str, Any] | None:
         """Read a PIN from a 1-based slot. Returns dict with status/code or None."""
+        async with self._operation_lock:
+            return await self._async_get_pin_unlocked(slot)
+
+    async def _async_get_pin_unlocked(self, slot: int) -> dict[str, Any] | None:
+        """Read one PIN while the caller holds the device operation lock."""
         if not self._cluster:
             return None
 
@@ -389,90 +405,96 @@ class IDLockDevice:
         }
 
     async def async_set_pin(self, slot: int, code: str) -> bool:
-        """Set a PIN on a slot. IDLock uses 1-based slot numbers natively."""
+        """Set and read back a PIN. IDLock uses 1-based slot numbers."""
         if not self._cluster:
             return False
 
-        try:
-            await self._cluster.set_pin_code(
-                slot,
-                1,  # UserStatus.OccupiedEnabled
-                0,  # UserType.Unrestricted
-                code,
+        async with self._operation_lock:
+            try:
+                result = await self._cluster.set_pin_code(
+                    slot,
+                    1,  # UserStatus.OccupiedEnabled
+                    0,  # UserType.Unrestricted
+                    code,
+                )
+                if not _command_result_succeeded(result):
+                    _LOGGER.error(
+                        "[IDLock] Set PIN slot %d rejected: result=%r", slot, result
+                    )
+                    return False
+                readback = await self._async_get_pin_unlocked(slot)
+            except Exception as e:  # noqa: BLE001
+                _LOGGER.error("[IDLock] Failed to set PIN slot %d: %s", slot, e)
+                return False
+
+            verified = bool(
+                readback
+                and readback["in_use"]
+                and readback["enabled"]
+                and readback["code"] == code
             )
-        except Exception as e:  # noqa: BLE001
-            _LOGGER.error("[IDLock] Failed to set PIN slot %d: %s", slot, e)
-            return False
-        else:
-            _LOGGER.debug("[IDLock] Set PIN on slot %d", slot)
-            return True
+            if not verified:
+                _LOGGER.error("[IDLock] PIN slot %d failed read-back verification", slot)
+            return verified
 
     async def async_clear_pin(self, slot: int) -> bool:
         """Clear a PIN from a slot."""
         if not self._cluster:
             return False
 
-        try:
-            await self._cluster.clear_pin_code(slot)
-        except Exception as e:  # noqa: BLE001
-            _LOGGER.error("[IDLock] Failed to clear PIN slot %d: %s", slot, e)
-            return False
-        else:
-            _LOGGER.debug("[IDLock] Cleared PIN slot %d", slot)
-            return True
+        async with self._operation_lock:
+            try:
+                result = await self._cluster.clear_pin_code(slot)
+                if not _command_result_succeeded(result):
+                    _LOGGER.error(
+                        "[IDLock] Clear PIN slot %d rejected: result=%r", slot, result
+                    )
+                    return False
+                readback = await self._async_get_pin_unlocked(slot)
+            except Exception as e:  # noqa: BLE001
+                _LOGGER.error("[IDLock] Failed to clear PIN slot %d: %s", slot, e)
+                return False
+            return bool(readback is not None and not readback["in_use"])
 
     async def async_enable_pin(self, slot: int) -> bool:
         """Enable a PIN slot."""
         if not self._cluster:
             return False
 
-        try:
-            await self._cluster.set_user_status(slot, 1)  # Enabled
-        except Exception as e:  # noqa: BLE001
-            _LOGGER.error("[IDLock] Failed to enable slot %d: %s", slot, e)
-            return False
-        else:
-            return True
+        async with self._operation_lock:
+            try:
+                result = await self._cluster.set_user_status(slot, 1)  # Enabled
+                if not _command_result_succeeded(result):
+                    return False
+                readback = await self._async_get_pin_unlocked(slot)
+            except Exception as e:  # noqa: BLE001
+                _LOGGER.error("[IDLock] Failed to enable slot %d: %s", slot, e)
+                return False
+            return bool(readback and readback["in_use"] and readback["enabled"])
 
     async def async_disable_pin(self, slot: int) -> bool:
         """Disable a PIN slot."""
         if not self._cluster:
             return False
 
-        try:
-            await self._cluster.set_user_status(slot, 3)  # Disabled
-        except Exception as e:  # noqa: BLE001
-            _LOGGER.error("[IDLock] Failed to disable slot %d: %s", slot, e)
-            return False
-        else:
-            return True
-
-    async def async_get_pin_raw(self, slot: int) -> dict[str, Any] | None:
-        """Read a PIN slot and return raw response details for debugging."""
-        if not self._cluster:
-            return None
-
-        try:
-            resp = await self._cluster.get_pin_code(slot)
-        except Exception as e:  # noqa: BLE001
-            return {"slot": slot, "error": str(e)}
-
-        # Capture everything from the response object
-        raw: dict[str, Any] = {"slot": slot, "type": type(resp).__name__}
-        for attr_name in ("user_id", "user_status", "user_type", "code"):
-            val = getattr(resp, attr_name, "MISSING")
-            raw[attr_name] = repr(val)
-
-        # Also try index-based access (some zigpy responses are tuples)
-        if hasattr(resp, "__getitem__"):
-            with contextlib.suppress(Exception):
-                raw["raw_items"] = [repr(resp[i]) for i in range(len(resp))]
-
-        raw["repr"] = repr(resp)
-        return raw
+        async with self._operation_lock:
+            try:
+                result = await self._cluster.set_user_status(slot, 3)  # Disabled
+                if not _command_result_succeeded(result):
+                    return False
+                readback = await self._async_get_pin_unlocked(slot)
+            except Exception as e:  # noqa: BLE001
+                _LOGGER.error("[IDLock] Failed to disable slot %d: %s", slot, e)
+                return False
+            return bool(readback and readback["in_use"] and not readback["enabled"])
 
     async def async_get_rfid(self, slot: int) -> dict[str, Any] | None:
         """Read an RFID slot. Returns dict with status or None."""
+        async with self._operation_lock:
+            return await self._async_get_rfid_unlocked(slot)
+
+    async def _async_get_rfid_unlocked(self, slot: int) -> dict[str, Any] | None:
+        """Read one RFID slot while the caller holds the operation lock."""
         if not self._cluster:
             return None
 
@@ -496,17 +518,29 @@ class IDLockDevice:
         if not self._cluster:
             return False
 
-        try:
-            await self._cluster.clear_rfid_code(slot)
-        except Exception as e:  # noqa: BLE001
-            _LOGGER.error("[IDLock] Failed to clear RFID slot %d: %s", slot, e)
-            return False
-        else:
-            _LOGGER.debug("[IDLock] Cleared RFID slot %d", slot)
-            return True
+        async with self._operation_lock:
+            try:
+                result = await self._cluster.clear_rfid_code(slot)
+                if not _command_result_succeeded(result):
+                    _LOGGER.error(
+                        "[IDLock] Clear RFID slot %d rejected: result=%r", slot, result
+                    )
+                    return False
+                readback = await self._async_get_rfid_unlocked(slot)
+            except Exception as e:  # noqa: BLE001
+                _LOGGER.error("[IDLock] Failed to clear RFID slot %d: %s", slot, e)
+                return False
+            return bool(readback is not None and not readback["in_use"])
 
     async def async_read_all_slots(self, per_slot_timeout: float = 10.0) -> list[dict[str, Any]]:
         """Read all PIN and RFID slots from the lock hardware."""
+        async with self._operation_lock:
+            return await self._async_read_all_slots_unlocked(per_slot_timeout)
+
+    async def _async_read_all_slots_unlocked(
+        self, per_slot_timeout: float
+    ) -> list[dict[str, Any]]:
+        """Read all credentials while holding the device operation lock."""
         results: list[dict[str, Any]] = []
         total_slots = max(self.num_pin_slots, self.num_rfid_slots)
         empty_credential = {"in_use": False, "enabled": False}
@@ -515,7 +549,7 @@ class IDLockDevice:
             if slot <= self.num_pin_slots:
                 try:
                     pin_data = await asyncio.wait_for(
-                        self.async_get_pin(slot), timeout=per_slot_timeout
+                        self._async_get_pin_unlocked(slot), timeout=per_slot_timeout
                     )
                 except TimeoutError:
                     _LOGGER.warning(
@@ -529,7 +563,7 @@ class IDLockDevice:
             if slot <= self.num_rfid_slots:
                 try:
                     rfid_data = await asyncio.wait_for(
-                        self.async_get_rfid(slot), timeout=per_slot_timeout
+                        self._async_get_rfid_unlocked(slot), timeout=per_slot_timeout
                     )
                 except TimeoutError:
                     _LOGGER.warning(
@@ -557,16 +591,23 @@ class IDLockDevice:
 
     async def async_read_all_pins(self, per_slot_timeout: float = 10.0) -> list[dict[str, Any]]:
         """Read all PIN slots from the lock hardware (legacy, PIN-only)."""
-        results: list[dict[str, Any]] = []
-        for slot in range(1, self.num_pin_slots + 1):
-            try:
-                pin_data = await asyncio.wait_for(self.async_get_pin(slot), timeout=per_slot_timeout)
-            except TimeoutError:
-                _LOGGER.warning("[IDLock] Timeout reading PIN slot %d on %s — aborting scan", slot, self.ieee)
-                break
-            if pin_data:
-                results.append(pin_data)
-        return results
+        async with self._operation_lock:
+            results: list[dict[str, Any]] = []
+            for slot in range(1, self.num_pin_slots + 1):
+                try:
+                    pin_data = await asyncio.wait_for(
+                        self._async_get_pin_unlocked(slot), timeout=per_slot_timeout
+                    )
+                except TimeoutError:
+                    _LOGGER.warning(
+                        "[IDLock] Timeout reading PIN slot %d on %s — aborting scan",
+                        slot,
+                        self.ieee,
+                    )
+                    break
+                if pin_data:
+                    results.append(pin_data)
+            return results
 
     async def _write_mfr_attribute(self, attr_id: int, value: Any) -> bool:
         """Write a manufacturer-specific attribute to the lock.
@@ -623,82 +664,95 @@ class IDLockDevice:
 
     async def async_set_master_pin_mode(self, enabled: bool) -> bool:
         """Enable or disable master PIN for unlocking."""
-        if await self._write_mfr_attribute(ATTR_MASTER_PIN_MODE, int(enabled)):
-            self.master_pin_mode = enabled
-            return True
-        return False
+        async with self._operation_lock:
+            if await self._write_mfr_attribute(ATTR_MASTER_PIN_MODE, int(enabled)):
+                self.master_pin_mode = enabled
+                return True
+            return False
 
     async def async_set_rfid_enabled(self, enabled: bool) -> bool:
         """Enable or disable RFID unlocking."""
-        if await self._write_mfr_attribute(ATTR_RFID_ENABLED, int(enabled)):
-            self.rfid_enabled = enabled
-            return True
-        return False
+        async with self._operation_lock:
+            if await self._write_mfr_attribute(ATTR_RFID_ENABLED, int(enabled)):
+                self.rfid_enabled = enabled
+                return True
+            return False
 
     async def async_set_require_pin_for_rf(self, enabled: bool) -> bool:
         """Enable or disable requiring PIN for RF operations."""
-        if not self._cluster:
-            return False
-        try:
-            result = await asyncio.wait_for(
-                self._cluster.write_attributes({"require_pin_for_rf_operation": int(enabled)}),
-                timeout=10.0,
-            )
-            if not _write_result_succeeded(result):
-                _LOGGER.error("[IDLock] Require-PIN write rejected: result=%r", result)
+        async with self._operation_lock:
+            if not self._cluster:
                 return False
-            self.require_pin_for_rf = enabled
-        except Exception as e:  # noqa: BLE001
-            _LOGGER.error("[IDLock] Failed to set require PIN for RF: %s", e)
-            return False
-        else:
-            return True
+            try:
+                result = await asyncio.wait_for(
+                    self._cluster.write_attributes(
+                        {"require_pin_for_rf_operation": int(enabled)}
+                    ),
+                    timeout=10.0,
+                )
+                if not _write_result_succeeded(result):
+                    _LOGGER.error(
+                        "[IDLock] Require-PIN write rejected: result=%r", result
+                    )
+                    return False
+                self.require_pin_for_rf = enabled
+            except Exception as e:  # noqa: BLE001
+                _LOGGER.error("[IDLock] Failed to set require PIN for RF: %s", e)
+                return False
+            else:
+                return True
 
     async def async_set_audio_volume(self, volume: int) -> bool:
         """Set audio volume (0=silent, 1=low, 2=high)."""
-        if not self._cluster:
-            return False
-        if not 0 <= volume <= 2:
-            return False
-        try:
-            result = await asyncio.wait_for(
-                self._cluster.write_attributes({"sound_volume": volume}),
-                timeout=10.0,
-            )
-            if not _write_result_succeeded(result):
-                _LOGGER.error("[IDLock] Audio-volume write rejected: result=%r", result)
+        async with self._operation_lock:
+            if not self._cluster:
                 return False
-            self.audio_volume = volume
-        except Exception as e:  # noqa: BLE001
-            _LOGGER.error("[IDLock] Failed to set audio volume: %s", e)
-            return False
-        else:
-            return True
+            if not 0 <= volume <= 2:
+                return False
+            try:
+                result = await asyncio.wait_for(
+                    self._cluster.write_attributes({"sound_volume": volume}),
+                    timeout=10.0,
+                )
+                if not _write_result_succeeded(result):
+                    _LOGGER.error(
+                        "[IDLock] Audio-volume write rejected: result=%r", result
+                    )
+                    return False
+                self.audio_volume = volume
+            except Exception as e:  # noqa: BLE001
+                _LOGGER.error("[IDLock] Failed to set audio volume: %s", e)
+                return False
+            else:
+                return True
 
     async def async_set_relock(self, enabled: bool) -> bool:
         """Enable or disable auto-relock."""
-        if await self._write_mfr_attribute(ATTR_RELOCK_ENABLED, int(enabled)):
-            self.relock_enabled = enabled
-            return True
-        return False
+        async with self._operation_lock:
+            if await self._write_mfr_attribute(ATTR_RELOCK_ENABLED, int(enabled)):
+                self.relock_enabled = enabled
+                return True
+            return False
 
     async def async_set_lock_mode(self, mode: int) -> bool:
         """Set lock mode (0-3: auto-lock/away-mode combinations)."""
-        if not 0 <= mode <= 3:
+        async with self._operation_lock:
+            if not 0 <= mode <= 3:
+                return False
+            if await self._write_mfr_attribute(ATTR_LOCK_MODE, mode):
+                self.lock_mode = mode
+                return True
             return False
-        if await self._write_mfr_attribute(ATTR_LOCK_MODE, mode):
-            self.lock_mode = mode
-            return True
-        return False
 
     async def async_set_service_pin_mode(self, mode: int) -> bool:
         """Set service PIN mode (0-9, see const.py for values)."""
-        if not 0 <= mode <= 9:
+        async with self._operation_lock:
+            if not 0 <= mode <= 9:
+                return False
+            if await self._write_mfr_attribute(ATTR_SERVICE_PIN_MODE, mode):
+                self.service_pin_mode = mode
+                return True
             return False
-        if await self._write_mfr_attribute(ATTR_SERVICE_PIN_MODE, mode):
-            self.service_pin_mode = mode
-            return True
-        return False
 
 
 def _get_zha_gateway(hass: HomeAssistant) -> Any:
@@ -731,6 +785,34 @@ def _write_result_succeeded(result: Any) -> bool:
         except (TypeError, ValueError):
             return False
     return True
+
+
+def _command_result_succeeded(result: Any) -> bool:
+    """Return whether a DoorLock command received a successful ZCL response."""
+    status = getattr(result, "status", None)
+    if status is not None:
+        try:
+            return int(status) == 0
+        except (TypeError, ValueError):
+            return False
+
+    if isinstance(result, (list, tuple)):
+        for item in result:
+            item_status = getattr(item, "status", None)
+            if item_status is not None:
+                try:
+                    return int(item_status) == 0
+                except (TypeError, ValueError):
+                    return False
+
+        # Some zigpy versions expose DefaultResponse as [command_id, status].
+        if len(result) == 2:
+            try:
+                return int(result[1]) == 0
+            except (TypeError, ValueError):
+                return False
+
+    return False
 
 
 def _find_door_lock_cluster(zigpy_device: Any) -> Any:

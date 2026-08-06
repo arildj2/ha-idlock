@@ -5,6 +5,7 @@ A Home Assistant custom integration for managing **Datek ID Lock 150 and 202** d
 ## Features
 
 - **Full PIN code management** — Set, clear, enable, and disable PIN codes directly on the lock hardware via the Zigbee DoorLock cluster
+- **Verified writes** — Slot state changes only after a successful ZCL response and matching hardware read-back
 - **RFID tag tracking** — Detect and manage RFID tags alongside PIN codes, shown on the same user row
 - **Side panel UI** — Dedicated sidebar panel with inline editing, per-row save, and progress indicators
 - **Lock settings** — Configure auto-lock, away mode, relock, audio volume, RFID, master PIN, and service PIN mode directly from the panel
@@ -64,7 +65,7 @@ This integration communicates with the lock **directly via the zigpy DoorLock cl
 - **Full verification** — Confirm set/clear operations succeeded by reading back from hardware
 - **No admin token required** — Runs inside HA with direct Python access to zigpy objects
 
-Access path:
+The ZHA-internal gateway lookup is isolated in one adapter function; all other code uses the public zigpy device and cluster APIs. Current access path:
 ```
 hass.data["zha"].gateway_proxy.gateway.application_controller.get_device(ieee)
   → zigpy Device → endpoints[1].in_clusters[0x0101] → DoorLock cluster
@@ -91,7 +92,7 @@ The ID Lock 150/202 are battery-powered Zigbee EndDevices that sleep to conserve
 | Lock/unlock detection | **Zero** | Lock pushes `operation_event_notification` |
 | Code change detection | **Zero** | Lock pushes `programming_event_notification` |
 | Sensor updates | **Zero** | Driven by push events |
-| Set/Clear/Enable/Disable PIN | **1 command** | User-initiated from panel |
+| Set/Clear/Enable/Disable PIN or clear RFID | **2 commands** | User command + verification read-back |
 | Change lock setting | **1 command** | User-initiated from panel |
 | "Sync from lock" full read | **50 commands** | Manual button (reads 25 PIN + 25 RFID slots) |
 | HA startup | **Zero** | Device lookup is local; no lock reads are performed |
@@ -101,7 +102,7 @@ After initial setup, the integration stays in sync via push notifications from t
 ### How Code Sync Works
 
 1. **On first setup**: The integration starts with an empty local slot index; use **Sync from lock** once to discover codes already stored in the lock
-2. **When you set/clear via the panel**: Single command to lock, then store updates locally
+2. **When you set/clear via the panel**: The command is checked and read back from hardware; only a matching result updates the local store
 3. **When someone adds/changes/deletes a code via the lock keypad**: The lock sends a `programming_event_notification` → integration updates its store and fires an event — **zero battery cost**
 4. **"Sync from lock" button**: Manual full re-read for reconciliation (for example, after enrolling an RFID tag on the lock)
 5. **No background polling** — Unlike Z-Wave integrations that can poll for free (cached data), Zigbee has no cache layer, so this integration never polls
@@ -128,7 +129,7 @@ The integration starts without sending Zigbee requests. Device lookup uses ZHA's
 1. Go to **Settings → Devices & Services → Add Integration**
 2. Search for **"ID Lock Manager"**
 3. Select your ZHA lock entities (multi-select supported)
-4. The integration will connect to each lock and discover existing codes in the background
+4. Open **ID Lock** in the sidebar and use **Sync from lock** once to discover existing codes
 
 ### Requirements
 
@@ -145,6 +146,7 @@ After setup, an **"ID Lock"** entry appears in the HA sidebar. The panel provide
 **Code management:**
 - **User table** — Shows only occupied slots with both PIN and RFID status per row
 - **Inline PIN entry** — Type a new PIN directly in the table row (digits only, 4–10 characters)
+- **PIN privacy** — Inputs are masked; explicitly revealed PINs are removed from the panel after 30 seconds
 - **Inline name editing** — Type a name for each user directly in the table
 - **Per-row Save** — Changes are staged locally; nothing is sent to the lock until you click Save
 - **Progress indicator** — Spinning animation and row dimming while communicating with the lock
@@ -163,6 +165,7 @@ After setup, an **"ID Lock"** entry appears in the HA sidebar. The panel provide
 - **Auto-relock** — Toggle
 - **Service PIN mode** — Dropdown with 10 modes (includes random PIN with instructions)
 - **Device info** — PIN/RFID slot count, PIN length range, IEEE address
+- **Refresh settings** — Bypass the five-minute settings cache and read current hardware values
 - **Staged saves** — All setting changes are staged; nothing sent until you click "Save settings"
 
 ### Sensors
@@ -254,10 +257,13 @@ The integration exposes a WebSocket API under the `idlock/` namespace for the si
 | `idlock/disable_code` | Disable a code slot |
 | `idlock/rename_code` | Update a slot's label |
 | `idlock/clear_rfid` | Clear an RFID tag from a slot |
-| `idlock/save_lock_meta` | Update lock name/max slots |
+| `idlock/save_lock_meta` | Update the lock name |
 | `idlock/read_all_codes` | Full hardware read of all PIN + RFID slots |
 | `idlock/get_device_settings` | Read lock settings (manufacturer attributes) |
 | `idlock/set_device_setting` | Write a single lock setting |
+| `idlock/read_pin` | Read one PIN for the panel's temporary reveal control |
+
+All WebSocket commands require a Home Assistant administrator. Raw debug endpoints are intentionally not included in production builds.
 
 ## Technical Details
 
@@ -285,7 +291,14 @@ Events received from the lock:
 
 ## License
 
-MIT
+The integration is released under the [MIT License](LICENSE). The vendored Lit
+bundle is BSD-3-Clause; see [third-party notices](THIRD_PARTY_NOTICES.md).
+
+## Development
+
+Run `python -m ruff check custom_components tests` and `python -m pytest -q`
+for the backend, then `npm ci && npm test` for frontend race/privacy tests.
+GitHub Actions also runs hassfest and HACS validation.
 
 ## Credits
 

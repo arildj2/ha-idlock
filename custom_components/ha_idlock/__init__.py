@@ -10,11 +10,9 @@ from typing import Any
 from homeassistant.components.frontend import async_remove_panel as remove_panel
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import (
-    config_validation as cv,
-    device_registry as dr,
-    entity_registry as er,
-)
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 
 from .const import (
     CONF_LOCKS,
@@ -56,6 +54,23 @@ def _get_friendly_name(hass: HomeAssistant, entity_id: str) -> str | None:
         return None
 
     return device.name_by_user or ent.original_name or device.name
+
+
+def _find_lock_entity_by_ieee(hass: HomeAssistant, ieee: str) -> str | None:
+    """Resolve the current entity id for a ZHA device IEEE address."""
+    ent_reg = er.async_get(hass)
+    dev_reg = dr.async_get(hass)
+    wanted = str(ieee)
+    for ent in ent_reg.entities.values():
+        if ent.domain != "lock" or ent.platform != "zha" or not ent.device_id:
+            continue
+        device = dev_reg.async_get(ent.device_id)
+        if device and any(
+            namespace == "zha" and str(identifier) == wanted
+            for namespace, identifier in device.identifiers
+        ):
+            return ent.entity_id
+    return None
 
 
 # Source value → string mapping
@@ -103,16 +118,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Seed locks from config entry
     cfg_locks: list[dict[str, Any]] = entry.data.get(CONF_LOCKS, [])
     selected_ieees: set[str] = set()
+    normalized_cfg_locks: list[dict[str, Any]] = []
 
     for item in cfg_locks:
-        entity_id = item.get("entity_id")
         raw_device_ieee = item.get("device_ieee")
+        entity_id = item.get("entity_id")
         name = item.get("name")
         max_slots = int(item.get("max_slots", 25))
 
         if not (entity_id and raw_device_ieee and name):
             continue
         device_ieee = str(raw_device_ieee)
+        entity_id = _find_lock_entity_by_ieee(hass, device_ieee) or entity_id
+        normalized_cfg_locks.append({**item, "entity_id": entity_id})
 
         selected_ieees.add(device_ieee)
 
@@ -134,6 +152,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 # Pick up device-registry renames unless the user explicitly
                 # renamed the lock via the panel.
                 stored_lock.name = friendly_name
+
+    if normalized_cfg_locks != cfg_locks:
+        hass.config_entries.async_update_entry(
+            entry,
+            data={**entry.data, CONF_LOCKS: normalized_cfg_locks},
+        )
 
     # Prune deselected locks
     to_delete = [ieee for ieee in list(store.locks) if ieee not in selected_ieees]
@@ -177,9 +201,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         try:
             # Lock is awake — opportunistically load device info if not yet read
+            lock = store.locks[device_ieee]
             device = get_device(hass, device_ieee)
-            if device.connected and not device.info_loaded:
-                hass.async_create_task(device.async_read_device_info())
+            if device.connected and not device.settings_are_fresh():
+                entry.async_create_background_task(
+                    hass,
+                    _async_refresh_device_info(store, lock, device),
+                    f"ID Lock device info {device_ieee}",
+                )
 
             command = data.get("command")
             args = data.get("args", {})
@@ -191,8 +220,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     args,
                 )
                 return
-            lock = store.locks[device_ieee]
-
             if command == "operation_event_notification":
                 _LOGGER.debug("[IDLock] operation_event args: %s", args)
                 _handle_operation_event(hass, lock, device_ieee, args)
@@ -207,14 +234,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Pre-import platform modules in the executor so async_forward_entry_setups
     # doesn't trigger a blocking import_module call inside the event loop.
-    await hass.async_add_import_executor_job(
-        importlib.import_module, f"{__package__}.sensor"
-    )
+    try:
+        await hass.async_add_import_executor_job(
+            importlib.import_module, f"{__package__}.sensor"
+        )
 
-    # Forward to entity platforms
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        # Forward to entity platforms
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except Exception:
+        unsub()
+        hass.data[DOMAIN].pop("unsub_zha_event", None)
+        with contextlib.suppress(Exception):
+            remove_panel(hass, PANEL_URL_PATH, warn_if_unknown=False)
+        hass.data[DOMAIN].pop("devices", None)
+        hass.data[DOMAIN].pop("store", None)
+        hass.data[DOMAIN].pop("entry", None)
+        raise
 
     return True
+
+
+async def _async_refresh_device_info(
+    store: IDLockStore, lock: Lock, device: Any
+) -> None:
+    """Refresh capabilities while a lock is awake and persist its slot limit."""
+    await device.async_read_device_info()
+    discovered_max = max(device.num_pin_slots, device.num_rfid_slots)
+    if lock.max_slots != discovered_max:
+        lock.max_slots = discovered_max
+        await store.async_save()
 
 
 def _handle_operation_event(
@@ -370,6 +418,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if unsub := hass.data.get(DOMAIN, {}).pop("unsub_zha_event", None):
         unsub()
+
+    # Flush any delayed programming-event save before dropping the store. This
+    # also cancels Store's delayed callback, preventing an old entry instance
+    # from overwriting data after a reload.
+    store: IDLockStore | None = hass.data.get(DOMAIN, {}).get("store")
+    if store is not None:
+        await store.async_save()
 
     # Clear cached device connections so reload gets fresh ones, and drop
     # the store so the (still registered) WS handlers don't serve stale data

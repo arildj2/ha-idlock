@@ -2,26 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
 import voluptuous as vol
-
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant
 
 from .const import (
-    ATTR_AUDIO_VOLUME,
-    ATTR_LOCK_FW_VERSION,
-    ATTR_LOCK_MODE,
-    ATTR_MASTER_PIN_MODE,
-    ATTR_RELOCK_ENABLED,
-    ATTR_RFID_ENABLED,
-    ATTR_SERVICE_PIN_MODE,
-    BASIC_CLUSTER_ID,
     DOMAIN,
-    IDLOCK_MANUFACTURER_CODE,
     WS_CLEAR_CODE,
     WS_DISABLE_CODE,
     WS_ENABLE_CODE,
@@ -41,8 +30,8 @@ _LOGGER = logging.getLogger(__name__)
 # Slot number must be 1-based, upper bound checked per-lock
 SLOT_SCHEMA = vol.All(int, vol.Range(min=1))
 
-# PIN code must be 4-10 digits
-PIN_CODE_SCHEMA = vol.All(str, vol.Match(r"^\d{4,10}$"))
+# Hardware-specific PIN length is checked after resolving the device.
+PIN_CODE_SCHEMA = vol.All(str, vol.Match(r"^\d+$"), vol.Length(max=255))
 
 _BOOLEAN_SETTINGS = {
     "master_pin_mode",
@@ -63,13 +52,17 @@ def _get_store(hass: HomeAssistant) -> IDLockStore | None:
 
 
 def _validate_slot(
-    connection: websocket_api.ActiveConnection, msg: dict[str, Any], lock: Any
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+    lock: Any,
+    max_slots: int | None = None,
 ) -> int | None:
-    """Validate the slot number against the lock's max_slots. Sends error on failure."""
+    """Validate a slot against discovered hardware or stored capabilities."""
     slot = int(msg["slot"])
-    if slot > lock.max_slots:
+    maximum = max_slots if max_slots is not None else lock.max_slots
+    if slot > maximum:
         connection.send_error(
-            msg["id"], "invalid_slot", f"Slot must be 1-{lock.max_slots}"
+            msg["id"], "invalid_slot", f"Slot must be 1-{maximum}"
         )
         return None
     return slot
@@ -215,10 +208,18 @@ async def ws_set_code(
         return
     store, lock, device = result
 
-    slot = _validate_slot(connection, msg, lock)
+    slot = _validate_slot(connection, msg, lock, device.num_pin_slots)
     if slot is None:
         return
-    success = await device.async_set_pin(slot, msg["code"])
+    code = msg["code"]
+    if not device.min_pin_len <= len(code) <= device.max_pin_len:
+        connection.send_error(
+            msg["id"],
+            "invalid_code",
+            f"PIN must contain {device.min_pin_len}-{device.max_pin_len} digits",
+        )
+        return
+    success = await device.async_set_pin(slot, code)
     if not success:
         connection.send_error(msg["id"], "device_error", f"Failed to set code on slot {slot}")
         return
@@ -245,7 +246,7 @@ async def ws_clear_code(
         return
     store, lock, device = result
 
-    slot = _validate_slot(connection, msg, lock)
+    slot = _validate_slot(connection, msg, lock, device.num_pin_slots)
     if slot is None:
         return
     success = await device.async_clear_pin(slot)
@@ -276,7 +277,7 @@ async def ws_enable_code(
         return
     store, lock, device = result
 
-    slot = _validate_slot(connection, msg, lock)
+    slot = _validate_slot(connection, msg, lock, device.num_pin_slots)
     if slot is None:
         return
     success = await device.async_enable_pin(slot)
@@ -304,7 +305,7 @@ async def ws_disable_code(
         return
     store, lock, device = result
 
-    slot = _validate_slot(connection, msg, lock)
+    slot = _validate_slot(connection, msg, lock, device.num_pin_slots)
     if slot is None:
         return
     success = await device.async_disable_pin(slot)
@@ -335,7 +336,7 @@ async def ws_clear_rfid(
         return
     store, lock, device = result
 
-    slot = _validate_slot(connection, msg, lock)
+    slot = _validate_slot(connection, msg, lock, device.num_rfid_slots)
     if slot is None:
         return
     success = await device.async_clear_rfid(slot)
@@ -389,14 +390,13 @@ async def ws_rename_code(
         vol.Required("type"): WS_SAVE_LOCK_META,
         vol.Required("device_ieee"): str,
         vol.Optional("name"): vol.All(str, vol.Length(min=1, max=64)),
-        vol.Optional("max_slots"): vol.All(int, vol.Range(min=1, max=255)),
     }
 )
 @websocket_api.async_response
 async def ws_save_lock_meta(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
 ) -> None:
-    """Update lock metadata (name, max_slots)."""
+    """Update user-editable lock metadata."""
     result = await _get_lock_and_device(hass, connection, msg)
     if not result:
         return
@@ -407,9 +407,6 @@ async def ws_save_lock_meta(
         # User explicitly renamed via the panel — don't overwrite from the
         # device registry on the next reload (see async_setup_entry).
         lock.custom_name = True
-    if "max_slots" in msg:
-        lock.max_slots = int(msg["max_slots"])
-
     await store.async_save()
     connection.send_result(msg["id"], _lock_to_dict(lock))
 
@@ -431,9 +428,13 @@ async def ws_read_all_codes(
         return
     store, lock, device = result
 
-    _LOGGER.info("[IDLock] Reading all %d slots from %s (PIN + RFID)...", device.num_pin_slots, lock.name)
-    all_slots = await device.async_read_all_slots()
     expected = max(device.num_pin_slots, device.num_rfid_slots)
+    _LOGGER.info(
+        "[IDLock] Reading all %d slots from %s (PIN + RFID)...",
+        expected,
+        lock.name,
+    )
+    all_slots = await device.async_read_all_slots()
     _LOGGER.info("[IDLock] Read %d/%d slot responses from %s", len(all_slots), expected, lock.name)
 
     # Only update store if we got a complete scan — partial data would
@@ -466,6 +467,7 @@ async def ws_read_all_codes(
         found_rfids,
         lock.name,
     )
+    lock.max_slots = expected
     await store.async_save()
 
     # Lock is confirmed awake after successful slot scan — try reading settings
@@ -480,7 +482,11 @@ async def ws_read_all_codes(
 
 @websocket_api.require_admin
 @websocket_api.websocket_command(
-    {vol.Required("type"): "idlock/get_device_settings", vol.Required("device_ieee"): str}
+    {
+        vol.Required("type"): "idlock/get_device_settings",
+        vol.Required("device_ieee"): str,
+        vol.Optional("force", default=False): bool,
+    }
 )
 @websocket_api.async_response
 async def ws_get_device_settings(
@@ -490,11 +496,12 @@ async def ws_get_device_settings(
     result = await _get_lock_and_device(hass, connection, msg, require_device=True)
     if not result:
         return
-    _, _, device = result
-    # Read attributes if not loaded yet (e.g. first settings panel open).
-    # Use a short per-read timeout — the lock is battery-powered and may be asleep.
-    if device.mfr_attrs_supported is None:
-        await device.async_read_device_info(timeout=8.0)
+    store, lock, device = result
+    await device.async_read_device_info(timeout=8.0, force=msg["force"])
+    discovered_max = max(device.num_pin_slots, device.num_rfid_slots)
+    if lock.max_slots != discovered_max:
+        lock.max_slots = discovered_max
+        await store.async_save()
     connection.send_result(msg["id"], device.get_device_info())
 
 
@@ -557,7 +564,7 @@ async def ws_read_pin(
         return
     _, lock, device = result
 
-    slot = _validate_slot(connection, msg, lock)
+    slot = _validate_slot(connection, msg, lock, device.num_pin_slots)
     if slot is None:
         return
     pin_data = await device.async_get_pin(slot)
@@ -565,145 +572,16 @@ async def ws_read_pin(
         connection.send_error(msg["id"], "device_error", f"Failed to read slot {slot}")
         return
 
-    # Lock is awake — opportunistically load settings in background
-    hass.async_create_task(device.async_try_read_settings_opportunistic())
+    # Lock is awake — refresh stale settings in a task owned by this entry.
+    entry = hass.data.get(DOMAIN, {}).get("entry")
+    if entry is not None:
+        entry.async_create_background_task(
+            hass,
+            device.async_try_read_settings_opportunistic(),
+            f"ID Lock settings refresh {device.ieee}",
+        )
 
     connection.send_result(msg["id"], {"slot": slot, "code": pin_data.get("code")})
-
-
-# --- Debug ---
-
-
-@websocket_api.require_admin
-@websocket_api.websocket_command(
-    {
-        vol.Required("type"): "idlock/debug_read_slot",
-        vol.Required("device_ieee"): str,
-        vol.Required("slot"): SLOT_SCHEMA,
-    }
-)
-@websocket_api.async_response
-async def ws_debug_read_slot(
-    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
-) -> None:
-    """Debug: read a single slot and return raw zigpy response details."""
-    result = await _get_lock_and_device(hass, connection, msg, require_device=True)
-    if not result:
-        return
-    _, lock, device = result
-
-    slot = _validate_slot(connection, msg, lock)
-    if slot is None:
-        return
-
-    raw = await device.async_get_pin_raw(slot)
-    connection.send_result(msg["id"], raw)
-
-
-@websocket_api.require_admin
-@websocket_api.websocket_command(
-    {vol.Required("type"): "idlock/debug_read_mfr_attrs", vol.Required("device_ieee"): str}
-)
-@websocket_api.async_response
-async def ws_debug_read_mfr_attrs(
-    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
-) -> None:
-    """Debug: try multiple strategies to read manufacturer-specific attributes."""
-    result = await _get_lock_and_device(hass, connection, msg, require_device=True)
-    if not result:
-        return
-    _, _, device = result
-
-    cluster = device._cluster  # noqa: SLF001
-    zigpy_dev = device._zigpy_device  # noqa: SLF001
-    debug: dict[str, Any] = {"ieee": device.ieee}
-
-    # Find Basic cluster
-    basic_cluster = None
-    if zigpy_dev:
-        for ep_id, ep in zigpy_dev.endpoints.items():
-            if ep_id == 0:
-                continue
-            if BASIC_CLUSTER_ID in ep.in_clusters:
-                basic_cluster = ep.in_clusters[BASIC_CLUSTER_ID]
-                break
-
-    # Test 1: Standard sound_volume read (should always work)
-    try:
-        r = await cluster.read_attributes(["sound_volume"])
-        attrs = r[0] if isinstance(r, (list, tuple)) else r
-        debug["test1_sound_volume"] = repr(attrs.get("sound_volume"))
-    except Exception as e:  # noqa: BLE001
-        debug["test1_sound_volume_error"] = f"{type(e).__name__}: {e}"
-
-    # Test 2: All mfr attrs at once with manufacturer code (current approach)
-    all_mfr = [ATTR_MASTER_PIN_MODE, ATTR_RFID_ENABLED, ATTR_SERVICE_PIN_MODE,
-               ATTR_LOCK_MODE, ATTR_RELOCK_ENABLED, ATTR_AUDIO_VOLUME]
-    try:
-        r = await asyncio.wait_for(
-            cluster._read_attributes(all_mfr, manufacturer=IDLOCK_MANUFACTURER_CODE),  # noqa: SLF001
-            timeout=10,
-        )
-        debug["test2_all_mfr_with_code"] = _parse_raw_records(r)
-    except Exception as e:  # noqa: BLE001
-        debug["test2_all_mfr_with_code_error"] = f"{type(e).__name__}: {e}"
-
-    # Test 3: Single mfr attr (0x4000) with manufacturer code
-    try:
-        r = await asyncio.wait_for(
-            cluster._read_attributes([ATTR_MASTER_PIN_MODE], manufacturer=IDLOCK_MANUFACTURER_CODE),  # noqa: SLF001
-            timeout=10,
-        )
-        debug["test3_single_0x4000_with_code"] = _parse_raw_records(r)
-    except Exception as e:  # noqa: BLE001
-        debug["test3_single_0x4000_with_code_error"] = f"{type(e).__name__}: {e}"
-
-    # Test 4: Single mfr attr (0x4000) WITHOUT manufacturer code
-    try:
-        r = await asyncio.wait_for(
-            cluster._read_attributes([ATTR_MASTER_PIN_MODE]),  # noqa: SLF001
-            timeout=10,
-        )
-        debug["test4_single_0x4000_no_code"] = _parse_raw_records(r)
-    except Exception as e:  # noqa: BLE001
-        debug["test4_single_0x4000_no_code_error"] = f"{type(e).__name__}: {e}"
-
-    # Test 5: Lock firmware from Basic cluster 0x5000
-    if basic_cluster:
-        try:
-            r = await asyncio.wait_for(
-                basic_cluster._read_attributes([ATTR_LOCK_FW_VERSION], manufacturer=IDLOCK_MANUFACTURER_CODE),  # noqa: SLF001
-                timeout=10,
-            )
-            debug["test5_lock_fw_0x5000"] = _parse_raw_records(r)
-        except Exception as e:  # noqa: BLE001
-            debug["test5_lock_fw_0x5000_error"] = f"{type(e).__name__}: {e}"
-
-    # Test 6: Basic cluster build_id (0x4000) — standard, no mfr code
-    if basic_cluster:
-        try:
-            r = await basic_cluster.read_attributes(["build_id"])
-            attrs = r[0] if isinstance(r, (list, tuple)) else r
-            debug["test6_basic_build_id"] = repr(attrs.get("build_id"))
-        except Exception as e:  # noqa: BLE001
-            debug["test6_basic_build_id_error"] = f"{type(e).__name__}: {e}"
-
-    connection.send_result(msg["id"], debug)
-
-
-def _parse_raw_records(raw_result: Any) -> dict[str, Any]:
-    """Parse raw attribute read result into a debug-friendly dict."""
-    parsed: dict[str, Any] = {}
-    if not isinstance(raw_result, (list, tuple)) or not raw_result:
-        return {"raw": repr(raw_result)[:300]}
-    for record in raw_result[0]:
-        aid = getattr(record, "attrid", None)
-        status = getattr(record, "status", None)
-        value_obj = getattr(record, "value", None)
-        val = getattr(value_obj, "value", None) if value_obj else None
-        key = f"0x{aid:04X}" if aid is not None else repr(aid)
-        parsed[key] = {"status": repr(status), "value": repr(val)}
-    return parsed
 
 
 def register_ws_handlers(hass: HomeAssistant) -> None:
@@ -722,7 +600,5 @@ def register_ws_handlers(hass: HomeAssistant) -> None:
         ws_clear_rfid,
         ws_get_device_settings,
         ws_set_device_setting,
-        ws_debug_read_slot,
-        ws_debug_read_mfr_attrs,
     ):
         websocket_api.async_register_command(hass, handler)

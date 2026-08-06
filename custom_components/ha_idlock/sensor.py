@@ -11,7 +11,7 @@ from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 
@@ -201,9 +201,7 @@ class IDLockLastPersonSensor(IDLockEventSensorBase):
         "last_changed",
     )
 
-    # Grace period (seconds) to wait for an operation event after a state change.
-    # If the lock fires both, the operation event arrives first and sets the person;
-    # the state change then arrives within this window and is ignored.
+    # Wait briefly for the richer ZHA event when the HA state event arrives first.
     _STATE_GRACE_SECONDS = 2.0
 
     def __init__(self, ieee: str, lock_entity_id: str) -> None:
@@ -212,7 +210,7 @@ class IDLockLastPersonSensor(IDLockEventSensorBase):
         self._attr_unique_id = f"{DOMAIN}_{ieee}_last_person"
         self._unsub_event: Any = None
         self._unsub_state: Any = None
-        self._last_event_time: float = 0.0
+        self._cancel_fallback: Any = None
 
     def _update_person(
         self,
@@ -265,7 +263,9 @@ class IDLockLastPersonSensor(IDLockEventSensorBase):
             elif not person:
                 person = source
 
-            self._last_event_time = dt_util.utcnow().timestamp()
+            if self._cancel_fallback:
+                self._cancel_fallback()
+                self._cancel_fallback = None
             self._update_person(person, operation, source, code_slot)
 
         @callback
@@ -280,12 +280,17 @@ class IDLockLastPersonSensor(IDLockEventSensorBase):
             if new_val != STATE_UNLOCKED or new_val == old_state.state:
                 return
 
-            # Skip if we just got an operation event within the grace period
-            now_ts = dt_util.utcnow().timestamp()
-            if now_ts - self._last_event_time < self._STATE_GRACE_SECONDS:
-                return
+            if self._cancel_fallback:
+                self._cancel_fallback()
 
-            self._update_person("unknown", "unlock", "unknown", 0)
+            @callback
+            def _write_fallback(_now: Any) -> None:
+                self._cancel_fallback = None
+                self._update_person("unknown", "unlock", "unknown", 0)
+
+            self._cancel_fallback = async_call_later(
+                self.hass, self._STATE_GRACE_SECONDS, _write_fallback
+            )
 
         self._unsub_event = self.hass.bus.async_listen(EVENT_IDLOCK, _handle_event)
         self._unsub_state = async_track_state_change_event(
@@ -298,4 +303,7 @@ class IDLockLastPersonSensor(IDLockEventSensorBase):
             self._unsub_event()
         if self._unsub_state:
             self._unsub_state()
+        if self._cancel_fallback:
+            self._cancel_fallback()
+            self._cancel_fallback = None
         await super().async_will_remove_from_hass()
