@@ -44,6 +44,76 @@ export class HaIdlockPanel extends LitElement {
     this._refreshRequest = 0;
     this._settingsRequest = 0;
     this._pinRequest = 0;
+    this._batteryEntityCache = new Map();  // device_id -> battery sensor entity_id | null
+  }
+
+  shouldUpdate(changedProperties) {
+    // HA replaces `hass` on every state change in the whole system. Only
+    // re-render for those when an entity shown on this panel changed.
+    if (changedProperties.size === 1 && changedProperties.has("hass")) {
+      const prev = changedProperties.get("hass");
+      if (!prev || !this.hass) return true;
+      return this._watchedEntityIds().some(
+        (id) => prev.states?.[id] !== this.hass.states?.[id]
+      );
+    }
+    return true;
+  }
+
+  _watchedEntityIds() {
+    const lock = this._selected;
+    if (!lock) return [];
+    const ids = [lock.entity_id];
+    const battery = this._batteryEntityId(lock.entity_id);
+    if (battery) ids.push(battery);
+    return ids;
+  }
+
+  _batteryEntityId(lockEntityId) {
+    const entities = this.hass?.entities;
+    const deviceId = entities?.[lockEntityId]?.device_id;
+    if (!deviceId) return null;
+    if (!this._batteryEntityCache.has(deviceId)) {
+      let found = null;
+      for (const [entityId, entry] of Object.entries(entities)) {
+        if (entry.device_id !== deviceId || !entityId.startsWith("sensor.")) continue;
+        if (this.hass.states?.[entityId]?.attributes?.device_class === "battery") {
+          found = entityId;
+          break;
+        }
+      }
+      // Don't cache a miss before states have loaded.
+      if (found || this.hass.states?.[lockEntityId]) {
+        this._batteryEntityCache.set(deviceId, found);
+      }
+      return found;
+    }
+    return this._batteryEntityCache.get(deviceId);
+  }
+
+  _renderLockStatus(lock) {
+    const lockState = this.hass?.states?.[lock.entity_id];
+    const batteryId = this._batteryEntityId(lock.entity_id);
+    const battery = batteryId ? this.hass.states?.[batteryId] : null;
+    const level = Number(battery?.state);
+    const stateIcon = {
+      locked: "mdi:lock",
+      unlocked: "mdi:lock-open-variant",
+      jammed: "mdi:lock-alert",
+      locking: "mdi:lock-clock",
+      unlocking: "mdi:lock-clock",
+      open: "mdi:door-open",
+    }[lockState?.state] ?? "mdi:lock-question";
+    return html`
+      ${lockState ? html`
+        <span class="stat lock-state status-${lockState.state}">
+          <ha-icon icon=${stateIcon}></ha-icon> ${lockState.state}
+        </span>` : ""}
+      ${battery && Number.isFinite(level) ? html`
+        <span class="stat ${level <= 20 ? "status-low" : ""}">
+          <ha-icon icon=${level <= 20 ? "mdi:battery-alert" : "mdi:battery"}></ha-icon> ${Math.round(level)}%
+        </span>` : ""}
+    `;
   }
 
   connectedCallback() {
@@ -377,21 +447,27 @@ export class HaIdlockPanel extends LitElement {
       return;
     }
     const ieee = this._selected?.device_ieee;
-    const request = ++this._pinRequest;
+    // _pinRequest is a generation counter bumped by _clearPinMemory; reveals
+    // of different slots may overlap, so don't invalidate each other.
+    const generation = this._pinRequest;
+    const isStale = () =>
+      generation !== this._pinRequest ||
+      this._selected?.device_ieee !== ieee ||
+      this._revealedPins[slotNum] !== "loading"; // hidden/cleared meanwhile
     this._revealedPins = { ...this._revealedPins, [slotNum]: "loading" };
     try {
       const result = await this._ws("idlock/read_pin", {
         device_ieee: ieee,
         slot: slotNum,
       });
-      if (request !== this._pinRequest || this._selected?.device_ieee !== ieee) return;
+      if (isStale()) return;
       const code = result.code || "";
       this._revealedPins = { ...this._revealedPins, [slotNum]: code };
       this._visiblePins = { ...this._visiblePins, [slotNum]: true };
       clearTimeout(this._pinHideTimers.get(slotNum));
       this._pinHideTimers.set(slotNum, setTimeout(() => this._hidePin(slotNum), 30000));
     } catch (e) {
-      if (request !== this._pinRequest || this._selected?.device_ieee !== ieee) return;
+      if (isStale()) return;
       this._revealedPins = { ...this._revealedPins, [slotNum]: "error" };
       this._error = e.message || "Failed to read PIN";
     }
@@ -424,6 +500,7 @@ export class HaIdlockPanel extends LitElement {
     const pending = this._confirmation;
     if (!pending) return;
     if (pending.kind === "pin") this._clearCode(pending.slot);
+    else if (pending.kind === "overwrite") this._addCode(pending.slot, pending.code, pending.label);
     else this._clearRfid(pending.slot);
   }
 
@@ -433,6 +510,11 @@ export class HaIdlockPanel extends LitElement {
 
   async _saveMeta(name) {
     if (!this._selected) return;
+    name = name?.trim();
+    if (!name || name === this._selected.name) {
+      this.requestUpdate(); // restore the input to the current name
+      return;
+    }
     this._busy = true;
     try {
       await this._ws("idlock/save_lock_meta", {
@@ -568,7 +650,12 @@ export class HaIdlockPanel extends LitElement {
         </div>
 
         ${this._error
-          ? html`<div class="error" role="alert">${this._error}</div>`
+          ? html`<div class="error" role="alert">
+              <span>${this._error}</span>
+              <button class="error-dismiss" aria-label="Dismiss error" @click=${() => { this._error = ""; }}>
+                <ha-icon icon="mdi:close"></ha-icon>
+              </button>
+            </div>`
           : ""}
 
         ${this._confirmation ? html`
@@ -581,14 +668,24 @@ export class HaIdlockPanel extends LitElement {
               @click=${(event) => event.stopPropagation()}
               @keydown=${this._handleConfirmationKeydown}
             >
-              <h2 id="confirm-title">Remove credential?</h2>
-              <p>
-                ${this._confirmation.kind === "pin" ? "Clear the PIN" : "Remove the RFID tag"}
-                from slot ${this._confirmation.slot}?
-              </p>
+              ${this._confirmation.kind === "overwrite" ? html`
+                <h2 id="confirm-title">Replace existing PIN?</h2>
+                <p>
+                  Slot ${this._confirmation.slot}${this._confirmation.existingLabel ? html` (${this._confirmation.existingLabel})` : ""}
+                  already has a PIN. Replace it with the new one?
+                </p>
+              ` : html`
+                <h2 id="confirm-title">Remove credential?</h2>
+                <p>
+                  ${this._confirmation.kind === "pin" ? "Clear the PIN" : "Remove the RFID tag"}
+                  from slot ${this._confirmation.slot}?
+                </p>
+              `}
               <div class="confirm-actions">
                 <button class="btn-secondary" @click=${() => { this._confirmation = null; }}>Cancel</button>
-                <button class="btn-primary btn-danger confirm-danger" @click=${this._runConfirmation}>Remove</button>
+                <button class="btn-primary btn-danger confirm-danger" @click=${this._runConfirmation}>
+                  ${this._confirmation.kind === "overwrite" ? "Replace" : "Remove"}
+                </button>
               </div>
             </section>
           </div>
@@ -666,14 +763,28 @@ export class HaIdlockPanel extends LitElement {
 
     const label = nameEl?.value?.trim() || "";
 
+    // Don't silently replace someone else's PIN when a used slot is typed.
+    const existing = this._selected?.slots?.[slot];
+    if (existing?.has_code) {
+      this._confirmation = { kind: "overwrite", slot, code, label, existingLabel: existing.label };
+      return;
+    }
+    await this._addCode(slot, code, label);
+  }
+
+  async _addCode(slot, code, label) {
+    this._confirmation = null;
     const saved = await this._setCode(slot, code, label, "Adding PIN...");
 
     // Clear inputs on success
     if (saved) {
-      pinEl.value = "";
+      const slotEl = this.shadowRoot?.querySelector("#add-slot");
+      const nameEl = this.shadowRoot?.querySelector("#add-name");
+      const pinEl = this.shadowRoot?.querySelector("#add-pin");
+      if (pinEl) pinEl.value = "";
       if (nameEl) nameEl.value = "";
       const nextFree = this._getNextFreeSlot();
-      if (nextFree) slotEl.value = String(nextFree);
+      if (slotEl && nextFree) slotEl.value = String(nextFree);
     }
   }
 
@@ -707,6 +818,7 @@ export class HaIdlockPanel extends LitElement {
       </div>
 
       <div class="stats-bar">
+        ${this._renderLockStatus(lock)}
         <span class="stat">${activeSlots.length} / ${maxSlots} users</span>
         ${pinCount > 0 ? html`<span class="stat">${pinCount} PINs</span>` : ""}
         ${rfidCount > 0 ? html`<span class="stat">${rfidCount} RFIDs</span>` : ""}
@@ -960,7 +1072,8 @@ export class HaIdlockPanel extends LitElement {
 
           <div class="setting-row">
             <label>Lock name</label>
-            <input type="text" .value=${lock.name} aria-label="Lock name"
+            <input type="text" .value=${live(lock.name)} aria-label="Lock name"
+              maxlength="64"
               @change=${(e) => { this._saveMeta(e.target.value); }} />
           </div>
 
@@ -1067,6 +1180,7 @@ export class HaIdlockPanel extends LitElement {
 
         <div class="setting-group">
           <h3>Device info</h3>
+          ${s.model ? html`<div class="info-row"><span>Model:</span> <span>${s.model}</span></div>` : ""}
           <div class="info-row"><span>PIN slots:</span> <span>${s.num_pin_slots ?? "?"}</span></div>
           <div class="info-row"><span>RFID slots:</span> <span>${s.num_rfid_slots ?? "?"}</span></div>
           <div class="info-row"><span>PIN length:</span> <span>${s.min_pin_len ?? "?"}–${s.max_pin_len ?? "?"} digits</span></div>
@@ -1114,7 +1228,16 @@ export class HaIdlockPanel extends LitElement {
         padding: 8px 16px;
         border-radius: 8px;
         margin-bottom: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
       }
+      .error-dismiss {
+        border: 0; background: transparent; color: inherit; padding: 2px;
+        display: inline-flex; border-radius: 4px;
+      }
+      .error-dismiss ha-icon { --mdc-icon-size: 18px; }
 
       .layout { display: grid; gap: 16px; }
       .desktop .layout { grid-template-columns: 240px 1fr; }
@@ -1179,7 +1302,14 @@ export class HaIdlockPanel extends LitElement {
         background: var(--secondary-background-color, #f0f0f0);
         padding: 4px 10px;
         border-radius: 12px;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
       }
+      .stat.lock-state { text-transform: capitalize; }
+      .stat ha-icon { --mdc-icon-size: 16px; }
+      .stat.status-unlocked, .stat.status-open { color: var(--warning-color, #ff9800); }
+      .stat.status-jammed, .stat.status-low { color: var(--error-color, #db4437); }
 
       .empty-state {
         text-align: center;

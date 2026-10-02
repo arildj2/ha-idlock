@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.0 — 2026-10-02
+
+- Fix lock events on current ZHA reporting slot N+1: ZHA adds 1 to the raw
+  user ID, but ID Lock slots are already 1-based.
+- Identify master-PIN unlocks (user ID 109, shown as code slot 110 by ZHA):
+  `ha_idlock_lock_event` gains `credential` (`master_pin`/`pin`/`rfid`/`unknown`)
+  and `user_id`; sensors show "Master PIN" instead of "slot 110".
+- Normalize ZHA operation names (`AutoLock` → `auto_lock`,
+  `UnlockFailureInvalidPINorID` → `unlock_failure_invalid_pin_or_id`).
+- Last person: count manual/key unlocks, and don't let the state fallback
+  overwrite a person already resolved from an earlier operation event.
+- Save lock battery: background device-info reads run once per HA start
+  instead of after nearly every lock event; failed reads back off 15 minutes.
+- Read the lock model with the module build so a Zigbee module moved into a
+  new lock body (150 → 202) refreshes its model; shown in the panel.
+- Sync from lock clears labels of slots found empty and drops slots above the
+  hardware limit; `set_code` without a label keeps the existing label.
+- Panel: show lock state and battery, confirm before replacing an existing PIN,
+  fix overlapping PIN reveals getting stuck, dismissable errors, ignore empty
+  lock names, and only re-render when the selected lock's entities change.
+- Faster entity lookup via device registry; tolerate a corrupt `max_slots`.
+
 ## 0.2.0 — 2026-08-06
 
 - Require successful ZCL status responses and matching hardware read-back for

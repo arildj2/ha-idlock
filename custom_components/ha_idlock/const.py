@@ -57,6 +57,11 @@ LOCK_MODE_AUTO_ON_AWAY_OFF = 1
 LOCK_MODE_AUTO_OFF_AWAY_ON = 2
 LOCK_MODE_AUTO_ON_AWAY_ON = 3
 
+# User ID the lock reports for keypad operations made with the master PIN
+# (verified on hardware: shows up as code_slot 110 in new-ZHA zha_events,
+# which add 1 to the raw user ID)
+MASTER_PIN_USER_ID = 109
+
 # Programming event codes (from ZCL DoorLock cluster command 0x21)
 PROG_EVENT_UNKNOWN = 0
 PROG_EVENT_MASTER_CODE_CHANGED = 1
@@ -71,7 +76,7 @@ PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 # Frontend / panel
 PANEL_URL_BASE = "/ha-idlock-frontend"
-PANEL_MODULE_URL = f"{PANEL_URL_BASE}/ha_idlock_panel.js?v=35"
+PANEL_MODULE_URL = f"{PANEL_URL_BASE}/ha_idlock_panel.js?v=37"
 PANEL_PATH = "frontend"
 PANEL_TITLE = "ID Lock"
 PANEL_ICON = "mdi:lock-smart"

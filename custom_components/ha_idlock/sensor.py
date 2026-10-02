@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from homeassistant.components.sensor import SensorEntity
@@ -21,6 +22,9 @@ from .storage import IDLockStore
 _LOGGER = logging.getLogger(__name__)
 
 STATE_UNLOCKED = "unlocked"
+
+# Successful unlock operations (zigpy OperationEvent names, snake_cased)
+UNLOCK_OPERATIONS = {"unlock", "manual_unlock", "key_unlock", "schedule_unlock"}
 
 
 async def async_setup_entry(
@@ -90,7 +94,7 @@ class IDLockLastEventSensor(IDLockEventSensorBase):
 
     _attr_icon = "mdi:lock-clock"
     _attr_name = "Last event"
-    _restore_keys = ("source", "operation", "code_slot", "lock_entity_id")
+    _restore_keys = ("source", "operation", "code_slot", "credential", "lock_entity_id")
 
     def __init__(self, ieee: str, lock_entity_id: str) -> None:
         """Initialize last event sensor for a lock."""
@@ -111,8 +115,11 @@ class IDLockLastEventSensor(IDLockEventSensorBase):
             source = data.get("source", "unknown")
             operation = data.get("operation", "unknown")
             code_slot = data.get("code_slot", 0)
+            credential = data.get("credential")
 
-            if code_slot > 0:
+            if credential == "master_pin":
+                self._attr_native_value = f"{operation} via {source} (master PIN)"
+            elif code_slot > 0:
                 self._attr_native_value = f"{operation} via {source} (slot {code_slot})"
             else:
                 self._attr_native_value = f"{operation} via {source}"
@@ -121,6 +128,7 @@ class IDLockLastEventSensor(IDLockEventSensorBase):
                 "source": source,
                 "operation": operation,
                 "code_slot": code_slot,
+                "credential": credential,
                 "lock_entity_id": self._lock_entity_id,
             }
             self.async_write_ha_state()
@@ -211,6 +219,7 @@ class IDLockLastPersonSensor(IDLockEventSensorBase):
         self._unsub_event: Any = None
         self._unsub_state: Any = None
         self._cancel_fallback: Any = None
+        self._last_unlock_event_at: float | None = None
 
     def _update_person(
         self,
@@ -246,7 +255,7 @@ class IDLockLastPersonSensor(IDLockEventSensorBase):
             source = data.get("source", "unknown")
             operation = data.get("operation", "unknown")
             code_slot = data.get("code_slot", 0)
-            if operation != "unlock":
+            if operation not in UNLOCK_OPERATIONS:
                 return
 
             # Resolve person name from slot label in store
@@ -258,11 +267,14 @@ class IDLockLastPersonSensor(IDLockEventSensorBase):
                     if lock and code_slot in lock.slots:
                         person = lock.slots[code_slot].label
 
-            if not person and code_slot > 0:
+            if data.get("credential") == "master_pin":
+                person = "Master PIN"
+            elif not person and code_slot > 0:
                 person = f"Slot {code_slot}"
             elif not person:
                 person = source
 
+            self._last_unlock_event_at = time.monotonic()
             if self._cancel_fallback:
                 self._cancel_fallback()
                 self._cancel_fallback = None
@@ -278,6 +290,15 @@ class IDLockLastPersonSensor(IDLockEventSensorBase):
 
             new_val = new_state.state
             if new_val != STATE_UNLOCKED or new_val == old_state.state:
+                return
+
+            # The operation event may arrive before the state change; don't
+            # let the fallback overwrite the person it already resolved.
+            if (
+                self._last_unlock_event_at is not None
+                and time.monotonic() - self._last_unlock_event_at
+                < self._STATE_GRACE_SECONDS
+            ):
                 return
 
             if self._cancel_fallback:

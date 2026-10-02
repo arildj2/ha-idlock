@@ -34,6 +34,12 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 SETTINGS_CACHE_TTL = 300.0
+# Wake-triggered (background) reads happen only until device info has been
+# loaded once per HA run; firmware, capabilities and settings rarely change and
+# every extra request keeps a battery lock's radio awake. After a failed read,
+# wait this long before trying again on a later wake. The panel still reads on
+# open (subject to SETTINGS_CACHE_TTL) and on "Refresh settings".
+OPPORTUNISTIC_RETRY_INTERVAL = 900.0
 
 
 class IDLockDevice:
@@ -66,12 +72,14 @@ class IDLockDevice:
         # Firmware versions (from Basic cluster)
         self.lock_firmware: str | None = None      # 0x5000: lock firmware (e.g. "1.5.0")
         self.module_build: str | None = None       # 0x4000: Zigbee module build (e.g. "0.7")
+        self.model: str | None = None              # 0x0005: e.g. "ID Lock 202"
 
         # IDLock manufacturer-specific settings
         # ID Lock is a sleepy battery device. Keep every request to one lock in
         # a single queue so panel tabs, automations, and wake events cannot race.
         self._operation_lock = asyncio.Lock()
         self._settings_updated_at: float | None = None
+        self._opportunistic_attempt_at: float | None = None
         self.mfr_attrs_supported: bool | None = None  # None=unknown, True/False after first read
         self.master_pin_mode: bool | None = None
         self.rfid_enabled: bool | None = None
@@ -130,6 +138,19 @@ class IDLockDevice:
             < SETTINGS_CACHE_TTL
         )
 
+    def claim_opportunistic_refresh(self) -> bool:
+        """Return True, and record the attempt, if a wake-triggered refresh should run."""
+        if not self.connected or self.info_loaded:
+            return False
+        now = asyncio.get_running_loop().time()
+        if (
+            self._opportunistic_attempt_at is not None
+            and now - self._opportunistic_attempt_at < OPPORTUNISTIC_RETRY_INTERVAL
+        ):
+            return False
+        self._opportunistic_attempt_at = now
+        return True
+
     async def async_read_device_info(
         self, timeout: float = 15.0, *, force: bool = False
     ) -> None:
@@ -181,14 +202,20 @@ class IDLockDevice:
             _LOGGER.debug("[IDLock] No Basic cluster found on %s", self.ieee)
             return
 
-        # Read standard build_id (0x4000) — Zigbee module version
+        # Read standard build_id (0x4000) — Zigbee module version — and the
+        # model in the same request. ZHA only reads the model when a device is
+        # first interviewed, so a Zigbee module moved into a new lock body
+        # (e.g. 150 -> 202) keeps its old model until this refreshes zigpy's
+        # attribute cache; ZHA picks the new value up on its next restart.
         try:
-            result = await basic_cluster.read_attributes(["build_id"])
+            result = await basic_cluster.read_attributes(["build_id", "model"])
             attrs = result[0] if isinstance(result, (list, tuple)) else result
-            if "build_id" in attrs and attrs["build_id"] is not None:
+            if attrs.get("build_id") is not None:
                 self.module_build = str(attrs["build_id"])
+            if attrs.get("model"):
+                self.model = str(attrs["model"])
         except Exception:  # noqa: BLE001
-            _LOGGER.debug("[IDLock] Could not read build_id for %s", self.ieee)
+            _LOGGER.debug("[IDLock] Could not read build_id/model for %s", self.ieee)
 
         # Read manufacturer-specific lock firmware (0x5000) with Datek mfr code
         try:
@@ -334,9 +361,9 @@ class IDLockDevice:
         """Try reading settings with a short timeout — call when lock is known awake.
 
         Returns True if mfr attributes were successfully read.
-        Skips while the five-minute cache is fresh.
+        Skips once device info has been loaded (see claim_opportunistic_refresh).
         """
-        if self.settings_are_fresh():
+        if self.info_loaded:
             return self.mfr_attrs_supported is True
         if not self._cluster:
             return False
@@ -352,6 +379,7 @@ class IDLockDevice:
             "info_loaded": self.info_loaded,
             "lock_firmware": self.lock_firmware,
             "module_build": self.module_build,
+            "model": self.model,
             "mfr_attrs_supported": self.mfr_attrs_supported,
             "num_pin_slots": self.num_pin_slots,
             "num_rfid_slots": self.num_rfid_slots,
@@ -588,26 +616,6 @@ class IDLockDevice:
                 "rfid_enabled": rfid_data["enabled"],
             })
         return results
-
-    async def async_read_all_pins(self, per_slot_timeout: float = 10.0) -> list[dict[str, Any]]:
-        """Read all PIN slots from the lock hardware (legacy, PIN-only)."""
-        async with self._operation_lock:
-            results: list[dict[str, Any]] = []
-            for slot in range(1, self.num_pin_slots + 1):
-                try:
-                    pin_data = await asyncio.wait_for(
-                        self._async_get_pin_unlocked(slot), timeout=per_slot_timeout
-                    )
-                except TimeoutError:
-                    _LOGGER.warning(
-                        "[IDLock] Timeout reading PIN slot %d on %s — aborting scan",
-                        slot,
-                        self.ieee,
-                    )
-                    break
-                if pin_data:
-                    results.append(pin_data)
-            return results
 
     async def _write_mfr_attribute(self, attr_id: int, value: Any) -> bool:
         """Write a manufacturer-specific attribute to the lock.

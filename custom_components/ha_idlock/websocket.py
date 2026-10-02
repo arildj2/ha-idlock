@@ -195,7 +195,7 @@ async def ws_get_lock(
         vol.Required("device_ieee"): str,
         vol.Required("slot"): SLOT_SCHEMA,
         vol.Required("code"): PIN_CODE_SCHEMA,
-        vol.Optional("label", default=""): vol.All(str, vol.Length(max=30)),
+        vol.Optional("label"): vol.All(str, vol.Length(max=30)),
     }
 )
 @websocket_api.async_response
@@ -225,7 +225,8 @@ async def ws_set_code(
         return
 
     s = store.ensure_slot(lock, slot)
-    s.label = msg["label"]
+    if "label" in msg:
+        s.label = msg["label"]
     s.enabled = True
     s.has_code = True
     await store.async_save()
@@ -452,6 +453,12 @@ async def ws_read_all_codes(
     found_rfids = 0
     for slot_data in all_slots:
         slot_num = slot_data["slot"]
+        if not (slot_data["has_pin"] or slot_data["has_rfid"]):
+            # Credential was removed while HA wasn't listening (e.g. at the
+            # keypad during a restart). Drop the stale label so a credential
+            # later added to this slot isn't attributed to the previous user.
+            lock.slots.pop(slot_num, None)
+            continue
         s = store.ensure_slot(lock, slot_num)
         s.has_code = slot_data["has_pin"]
         s.has_rfid = slot_data["has_rfid"]
@@ -460,6 +467,8 @@ async def ws_read_all_codes(
             found_pins += 1
         if slot_data["has_rfid"]:
             found_rfids += 1
+    for slot_num in [n for n in lock.slots if n > expected]:
+        del lock.slots[slot_num]
 
     _LOGGER.info(
         "[IDLock] Found %d PINs and %d RFIDs on %s",

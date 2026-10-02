@@ -89,3 +89,14 @@ async def test_device_info_uses_one_overall_timeout() -> None:
     await device.async_read_device_info(timeout=0.01, force=True)
 
     device._read_idlock_attributes.assert_not_awaited()  # noqa: SLF001
+
+
+async def test_opportunistic_refresh_is_throttled() -> None:
+    """Wake events trigger at most one background read until info is loaded."""
+    device = _device(SimpleNamespace())
+    assert device.claim_opportunistic_refresh() is True
+    assert device.claim_opportunistic_refresh() is False  # failed read: back off
+
+    device._opportunistic_attempt_at = None  # noqa: SLF001
+    device.mfr_attrs_supported = True  # loaded once this run
+    assert device.claim_opportunistic_refresh() is False

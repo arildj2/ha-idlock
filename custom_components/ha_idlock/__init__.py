@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import logging
+import re
 from typing import Any
 
 from homeassistant.components.frontend import async_remove_panel as remove_panel
@@ -14,6 +15,7 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 
+from .config_flow import _entity_id_for_ieee
 from .const import (
     CONF_LOCKS,
     DOMAIN,
@@ -21,6 +23,7 @@ from .const import (
     EVENT_IDLOCK,
     EVENT_IDLOCK_CODE_CHANGED,
     EVENT_ZHA,
+    MASTER_PIN_USER_ID,
     PANEL_URL_PATH,
     PLATFORMS,
     PROG_EVENT_MASTER_CODE_CHANGED,
@@ -54,23 +57,6 @@ def _get_friendly_name(hass: HomeAssistant, entity_id: str) -> str | None:
         return None
 
     return device.name_by_user or ent.original_name or device.name
-
-
-def _find_lock_entity_by_ieee(hass: HomeAssistant, ieee: str) -> str | None:
-    """Resolve the current entity id for a ZHA device IEEE address."""
-    ent_reg = er.async_get(hass)
-    dev_reg = dr.async_get(hass)
-    wanted = str(ieee)
-    for ent in ent_reg.entities.values():
-        if ent.domain != "lock" or ent.platform != "zha" or not ent.device_id:
-            continue
-        device = dev_reg.async_get(ent.device_id)
-        if device and any(
-            namespace == "zha" and str(identifier) == wanted
-            for namespace, identifier in device.identifiers
-        ):
-            return ent.entity_id
-    return None
 
 
 # Source value → string mapping
@@ -124,12 +110,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raw_device_ieee = item.get("device_ieee")
         entity_id = item.get("entity_id")
         name = item.get("name")
-        max_slots = int(item.get("max_slots", 25))
+        try:
+            max_slots = max(1, min(255, int(item.get("max_slots", 25))))
+        except (TypeError, ValueError):
+            max_slots = 25
 
         if not (entity_id and raw_device_ieee and name):
             continue
         device_ieee = str(raw_device_ieee)
-        entity_id = _find_lock_entity_by_ieee(hass, device_ieee) or entity_id
+        entity_id = _entity_id_for_ieee(hass, device_ieee) or entity_id
         normalized_cfg_locks.append({**item, "entity_id": entity_id})
 
         selected_ieees.add(device_ieee)
@@ -203,7 +192,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # Lock is awake — opportunistically load device info if not yet read
             lock = store.locks[device_ieee]
             device = get_device(hass, device_ieee)
-            if device.connected and not device.settings_are_fresh():
+            if device.claim_opportunistic_refresh():
                 entry.async_create_background_task(
                     hass,
                     _async_refresh_device_info(store, lock, device),
@@ -275,20 +264,35 @@ def _handle_operation_event(
     # ZHA ≥2025.x uses string keys: source, operation, code_slot
     # Older ZHA uses integer keys: operation_event_source, operation_event_code, user_id
     if "source" in args:
-        source = str(args["source"]).lower()
-        operation = str(args.get("operation", "unknown")).lower()
+        source = _snake_case(args["source"])
+        operation = _snake_case(args.get("operation", "unknown"))
         raw_slot = args.get("code_slot")
+        # New ZHA adds 1 to the raw user_id assuming 0-based ZCL slots, but
+        # ID Lock already reports 1-based slots, so undo ZHA's offset.
+        slot_offset = -1
     else:
         source = _parse_value(args.get("operation_event_source"), _SOURCE_MAP)
         operation = _parse_value(args.get("operation_event_code"), _OPERATION_MAP)
         raw_slot = args.get("user_id")
+        slot_offset = 0
 
+    # code_slot is only set for real user slots; master PIN and other
+    # out-of-range IDs are reported via "credential" and "user_id" instead.
     code_slot = 0
+    user_id: int | None = None
+    credential: str | None = None
     if raw_slot is not None and source in ("keypad", "rfid"):
         try:
-            code_slot = int(raw_slot)  # IDLock reports 1-based slot numbers
+            user_id = int(raw_slot) + slot_offset
         except (ValueError, TypeError):
-            code_slot = 0
+            user_id = None
+        if user_id == MASTER_PIN_USER_ID and source == "keypad":
+            credential = "master_pin"
+        elif user_id is not None and 1 <= user_id <= lock.max_slots:
+            code_slot = user_id
+            credential = "pin" if source == "keypad" else "rfid"
+        elif user_id is not None and user_id > 0:
+            credential = "unknown"
 
     hass.bus.async_fire(
         EVENT_IDLOCK,
@@ -299,6 +303,8 @@ def _handle_operation_event(
             "source": source,
             "operation": operation,
             "code_slot": code_slot,
+            "credential": credential,
+            "user_id": user_id,
         },
     )
 
@@ -455,6 +461,14 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     # same HA process does not try to register duplicate handlers/routes.
     for key in ("devices", "store", "entry", "panel_registered"):
         domain_data.pop(key, None)
+
+
+def _snake_case(value: Any) -> str:
+    """Normalize zigpy enum names ("AutoLock") to the legacy form ("auto_lock")."""
+    text = str(value) if value is not None else "unknown"
+    # zigpy spells this "...InvalidPINorID", which the regex below can't split.
+    text = text.replace("PINorID", "PinOrId")
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", "_", text).lower()
 
 
 def _parse_value(value: Any, mapping: dict[int, str]) -> str:
