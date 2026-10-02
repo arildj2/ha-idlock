@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 — 2026-10-02
+
+- HA 2026.8+ split each lock into two devices (ZHA's and a duplicate owned by
+  ID Lock Manager holding its sensors). Sensors now link to the ZHA lock device
+  via `device_entry`, and the emptied duplicates are removed on setup.
+- Replace the deprecated `device_registry.async_get_device` lookup (removed in
+  HA 2027.8) with `async_get_devices`, falling back on older HA.
+
 ## 0.3.0 — 2026-10-02
 
 - Fix lock events on current ZHA reporting slot N+1: ZHA adds 1 to the raw

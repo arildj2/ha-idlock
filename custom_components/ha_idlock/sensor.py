@@ -10,7 +10,7 @@ from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import Event, HomeAssistant, callback
-from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.device import async_entity_id_to_device
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -43,9 +43,18 @@ async def async_setup_entry(
         if not ieee:
             continue
 
-        entities.append(IDLockLastEventSensor(ieee, entity_id))
-        entities.append(IDLockCodeChangeSensor(ieee, entity_id))
-        entities.append(IDLockLastPersonSensor(ieee, entity_id))
+        # Show the sensors on the ZHA lock's device page. Since HA 2026.8 a
+        # device belongs to a single config entry, so link to ZHA's device
+        # instead of claiming it with DeviceInfo (which creates a duplicate).
+        device_entry = async_entity_id_to_device(hass, entity_id) if entity_id else None
+        for sensor_cls in (
+            IDLockLastEventSensor,
+            IDLockCodeChangeSensor,
+            IDLockLastPersonSensor,
+        ):
+            sensor = sensor_cls(ieee, entity_id)
+            sensor.device_entry = device_entry
+            entities.append(sensor)
 
     if entities:
         async_add_entities(entities)
@@ -69,9 +78,6 @@ class IDLockEventSensorBase(SensorEntity, RestoreEntity):
         self._lock_entity_id = lock_entity_id
         self._attr_native_value: str | None = None
         self._event_data: dict[str, Any] = {}
-        # Attach to the existing ZHA lock device so the sensors appear on
-        # the lock's device page alongside the lock entity.
-        self._attr_device_info = DeviceInfo(identifiers={("zha", ieee)})
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

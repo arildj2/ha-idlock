@@ -46,14 +46,22 @@ def _entity_to_lock_dict(hass: HomeAssistant, entity_id: str) -> dict[str, Any] 
 
 def _entity_id_for_ieee(hass: HomeAssistant, ieee: str) -> str | None:
     """Find the current ZHA lock entity id after an entity-registry rename."""
-    device = dr.async_get(hass).async_get_device(identifiers={("zha", str(ieee))})
-    if device is None:
-        return None
-    for ent in er.async_entries_for_device(
-        er.async_get(hass), device.id, include_disabled_entities=True
-    ):
-        if ent.domain == "lock" and ent.platform == "zha":
-            return ent.entity_id
+    dev_reg = dr.async_get(hass)
+    ent_reg = er.async_get(hass)
+    identifiers = {("zha", str(ieee))}
+    if hasattr(dev_reg, "async_get_devices"):
+        # HA 2026.9+: identifiers are only unique per config entry, so several
+        # devices may match; async_get_device is deprecated.
+        devices = dev_reg.async_get_devices(identifiers=identifiers)
+    else:
+        device = dev_reg.async_get_device(identifiers=identifiers)
+        devices = [device] if device else []
+    for device in devices:
+        for ent in er.async_entries_for_device(
+            ent_reg, device.id, include_disabled_entities=True
+        ):
+            if ent.domain == "lock" and ent.platform == "zha":
+                return ent.entity_id
     return None
 
 
